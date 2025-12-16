@@ -196,6 +196,7 @@ class SurveyRow:
     block_id: Optional[int] = None
 
 @dataclass
+@dataclass
 class QuestionBlock:
     block_id: int
     # All row indices belonging to this block (into SurveyFileContext.rows)
@@ -563,6 +564,24 @@ def should_run_copy_check(english_text: str) -> bool:
     return True
 
 
+
+# ---------------------------
+# Invariant numeric/range guards
+# ---------------------------
+_PURE_NUMERIC_OR_RANGE_RE = re.compile(r"^[\d\s\-\–\—/.,%+$€£¥]+$")
+
+def strip_html_for_heuristics(text: str) -> str:
+    """Strip HTML tags and collapse whitespace for heuristics only."""
+    if not text:
+        return ""
+    s = re.sub(r"<[^>]+>", " ", text)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+def is_pure_numeric_or_range_code_like(text: str) -> bool:
+    """True for strings like '1970-1989', '2024', '$100', '10-15%' (no letters)."""
+    s = strip_html_for_heuristics(text)
+    return bool(s) and bool(_PURE_NUMERIC_OR_RANGE_RE.fullmatch(s))
 def is_label_like_english(text: str) -> bool:
     """
     Heuristic to detect short, stand-alone label-like English text
@@ -771,6 +790,7 @@ async def call_translation_model_async(
         existing_translation: Optional[str] = None,
         segment_type: Optional[SegmentType] = None,
         block_style: Optional[BlockStyle] = None,
+        peer_english_options: Optional[List[str]] = None,
         parent_context: str = "",
         model_name: str = TRANSLATION_MODEL_NAME,
 ) -> Dict[str, object]:
@@ -806,6 +826,16 @@ async def call_translation_model_async(
             f'CONTEXT ALERT: The text below is an answer option or label for this question: '
             f'"{parent_context}".\n'
             f"Ensure your translation fits grammatically and logically as a response to this question."
+        )
+
+    peer_options_instruction = ""
+    if peer_english_options and segment_type_str == "answer_option":
+        # Provide the full ordered peer set so the model can keep options parallel.
+        peers_json = json.dumps(peer_english_options, ensure_ascii=False)
+        peer_options_instruction = (
+            f"Peer answer options in this same set (English, ordered): {peers_json}\n"
+            "Keep this option grammatically and stylistically PARALLEL to its peers. "
+            "Do not mix label types (e.g., person-noun labels vs adjective labels) within the same set."
         )
 
     # --------- System & User Prompts (now outside the if-block) ---------
@@ -870,6 +900,8 @@ Segment metadata for this element:
 
 {context_instruction}
 
+{peer_options_instruction}
+
 English source text:
 \"\"\"{english_text}\"\"\"
 
@@ -900,6 +932,15 @@ Interpretation of segment_type and block_style:
     - Use short, symmetric phrases that clearly express the relative position on the
       scale (from most positive to most negative or vice versa), rather than long
       sentences or self-referential statements.
+    - Do NOT add parenthetical or slash-based variants (for example masculine/feminine
+      endings like "(a)" or "/a", or multiple gender forms) unless the English source
+      explicitly includes them. Keep each label as a single, simple form.
+    - When an existing translation already forms a clear, well-ordered scale, avoid
+      proposing changes that only reflect stylistic preferences (such as gender-inclusive
+      morphology or alternative but equivalent wording). Only propose changes to scale
+      labels when they fix problems with semantics, ordering, clarity, or obvious
+      unnaturalness in the target language.
+
 
 Instructions:
 1. If the existing translation is effectively empty or simply repeats the English text, treat this as if there
@@ -908,11 +949,17 @@ Instructions:
    except for proper names, brand names, and technical tokens.
 2. If the existing translation is non-empty and clearly already in the target language, treat it as the baseline
    and only propose changes if they improve:
+   - semantic accuracy or preservation of qualifiers,
+   - measurement safety (clearer distinctions or better ordered scale points),
+   - structural safety (fixing issues with tags, placeholders, numbers),
    - localization (correct regional variant),
    - terminology consistency,
    - grammar, tense, and style,
    - handling of proper nouns and numeric formatting,
    - accents and punctuation.
+   For scale_label elements in particular, you should NOT propose changes that only add
+   stylistic variants (such as explicit gender marking or inclusive forms) when the
+   existing label is already natural and forms part of a clear, symmetric scale.
 3. Always perform a self-QA step on your proposed translation. If your proposed translation, after stripping HTML
    tags and condensing whitespace, is still essentially identical to the English text, you must reconsider and
    produce a real translation in the target language.
@@ -1553,8 +1600,43 @@ async def process_row_async(
             row.new_translation = row.existing_translation
             return row
 
+        # Hard guard: if the source is *purely* numeric/range/code-like (e.g., '1970-1989'),
+        # keep it as a pure range/code in the output. This prevents drift into prose like
+        # 'Born between 1950 and 1969' and preserves visual parallelism across option sets.
+        if row.segment_type in {SegmentType.ANSWER_OPTION, SegmentType.SCALE_LABEL} and is_pure_numeric_or_range_code_like(eng_text):
+            if row.had_real_translation:
+                # If an existing translation is already numeric/range-like, keep it. If it was paraphrased, suggest fixing it.
+                if not is_pure_numeric_or_range_code_like(row.existing_translation):
+                    row.new_translation = row.existing_translation
+                    row.suggested_translation = eng_text
+                    row.suggestion_reason = ((row.suggestion_reason + " | ") if row.suggestion_reason else "") + "Numeric/range option should remain a pure range/code (no prose rewrites)."
+                else:
+                    row.new_translation = row.existing_translation
+                return row
+            else:
+                row.new_translation = eng_text
+                row.was_newly_translated = True
+                return row
+
         # Logic to find Parent Context (Question Text)
         parent_context_str = ""
+        peer_english_options = None
+
+        # For short categorical label sets, provide peer options to encourage parallel translations.
+        if row.segment_type == SegmentType.ANSWER_OPTION and context.blocks and row.block_id is not None:
+            try:
+                block = context.blocks[row.block_id]
+                opt_texts = [
+                    strip_html_for_heuristics(context.rows[i].english_text)
+                    for i in block.answer_option_indices
+                    if i is not None and context.rows[i].english_text
+                ]
+                opt_texts = [t for t in opt_texts if t]
+                # Only include peers for small, label-like sets; skip large lists (cities, months, etc.).
+                if 2 <= len(opt_texts) <= 8 and options_look_like_short_labels(opt_texts):
+                    peer_english_options = opt_texts
+            except Exception:
+                peer_english_options = None
         if row.segment_type in [SegmentType.ANSWER_OPTION, SegmentType.SCALE_LABEL]:
             if context.blocks and row.block_id is not None:
                 block = context.blocks[row.block_id]
@@ -1572,6 +1654,7 @@ async def process_row_async(
             existing_translation=row.existing_translation if row.had_real_translation else None,
             segment_type=row.segment_type,
             block_style=context.block_styles.get(row.block_id) if row.block_id is not None else None,
+            peer_english_options=peer_english_options,
             parent_context=parent_context_str
         )
 
