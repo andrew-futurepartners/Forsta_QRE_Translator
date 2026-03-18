@@ -196,7 +196,6 @@ class SurveyRow:
     block_id: Optional[int] = None
 
 @dataclass
-@dataclass
 class QuestionBlock:
     block_id: int
     # All row indices belonging to this block (into SurveyFileContext.rows)
@@ -1591,7 +1590,8 @@ async def process_row_async(
         row: SurveyRow,
         context: SurveyFileContext,
         global_context: str,
-        semaphore: asyncio.Semaphore,  # <--- Limit concurrency
+        semaphore: asyncio.Semaphore,
+        provide_suggestions: bool,
 ) -> SurveyRow:
     # Acquire slot in the semaphore (e.g., max 20 active requests)
     async with semaphore:
@@ -1599,6 +1599,12 @@ async def process_row_async(
         if not eng_text:
             row.new_translation = row.existing_translation
             return row
+        # If this row already had a real translation and suggestions are disabled,
+        # do not run QA and do not generate suggestions.
+        if row.had_real_translation and not provide_suggestions:
+            row.new_translation = row.existing_translation
+            return row
+
 
         # Hard guard: if the source is *purely* numeric/range/code-like (e.g., '1970-1989'),
         # keep it as a pure range/code in the output. This prevents drift into prose like
@@ -1661,6 +1667,15 @@ async def process_row_async(
         # --- Process Result (Same logic as before, just adapted for async return) ---
         proposed = result.get("qa_checked_translation") or result.get("proposed_translation") or ""
 
+        is_ok, msg = validate_translation_structure(eng_text, proposed)
+        if not is_ok:
+            # keep existing (or English if it was placeholder)
+            base = row.existing_translation or eng_text
+            row.new_translation = base
+            row.suggested_translation = base  # or leave blank; depends on your UX
+            row.suggestion_reason = ((row.suggestion_reason + " | ") if row.suggestion_reason else "") + \
+                                    f"Structure validation warning: {msg}"
+            return row
 
         # Safety: if there was no prior real translation and the model's output is
         # effectively just the English again, treat this as a likely failure and flag it.
@@ -1701,7 +1716,7 @@ async def process_row_async(
         return row
 
 
-def consistency_pass(context: SurveyFileContext) -> None:
+def consistency_pass(context: SurveyFileContext, apply_to_new_translations: bool = False) -> None:
     """
     Survey-wide consistency pass (LLM-powered) using Fuzzy Matching.
 
@@ -1763,39 +1778,73 @@ def consistency_pass(context: SurveyFileContext) -> None:
     # Ask the LLM to decide canonical translations and which indices to update
     issues = call_consistency_model(context, phrase_groups)
 
+    # Lookup so we can see all indices/translations for an english_phrase
+    group_lookup = {g["english_phrase"]: g for g in phrase_groups}
+
     for issue in issues:
         english_phrase = issue.get("english_phrase", "")
         canonical = (issue.get("canonical_translation") or "").strip()
         indices_to_update = issue.get("indices_to_update") or []
         notes = issue.get("notes") or ""
 
+        # If the model says "don't unify", it should return no indices.
         if not canonical or not indices_to_update:
             continue
 
-        for idx in indices_to_update:
-            # defensive: ensure idx is a valid row index
-            if not isinstance(idx, int):
-                continue
+        group = group_lookup.get(english_phrase)
+        if not group:
+            continue
+
+        # Prefer an existing (pre-run) translation as canonical if present,
+        # because we do NOT want to rewrite old translations when suggestions are off.
+        locked_counts: Dict[str, int] = {}
+        for t in group.get("translations", []):
+            trl = (t.get("translation") or "").strip()
+            for idx in (t.get("indices") or []):
+                if isinstance(idx, int) and 0 <= idx < len(context.rows):
+                    if not context.rows[idx].was_newly_translated and trl:
+                        locked_counts[trl] = locked_counts.get(trl, 0) + 1
+
+        canonical_to_apply = max(locked_counts, key=locked_counts.get) if locked_counts else canonical
+
+        # Update *all* rows in this group (not only indices_to_update),
+        # but ONLY those that were newly translated in this run, and only if the model
+        # decided the group should be unified (indices_to_update non-empty).
+        all_group_indices = set()
+        for t in group.get("translations", []):
+            for idx in (t.get("indices") or []):
+                if isinstance(idx, int):
+                    all_group_indices.add(idx)
+
+        for idx in sorted(all_group_indices):
             if idx < 0 or idx >= len(context.rows):
                 continue
 
             row = context.rows[idx]
 
-            # Don't override existing suggestions from row-level QA or validation
+            # Preserve your existing “skip structural warnings” behavior
+            if "Structure validation warning" in (row.suggestion_reason or ""):
+                continue
+
+            # Don’t stomp row-level error flags/suggestions (copy-check, errors, etc.)
             if (row.suggested_translation or "").strip():
                 continue
 
-            row.suggested_translation = canonical
-            base_reason = (
-                f"LLM consistency suggestion: The concept '{english_phrase}' "
-                f"appears with multiple translations. "
-                f"Suggested canonical: '{canonical}'."
-            )
-            if notes:
-                row.suggestion_reason = base_reason + f" Note: {notes}"
+            if apply_to_new_translations:
+                if not row.was_newly_translated:
+                    continue
+                row.new_translation = canonical_to_apply
             else:
-                row.suggestion_reason = base_reason
-
+                # Original behavior: write as a suggestion only
+                if (row.suggested_translation or "").strip():
+                    continue
+                row.suggested_translation = canonical_to_apply
+                base_reason = (
+                    f"LLM consistency suggestion: The concept '{english_phrase}' "
+                    f"appears with multiple translations. "
+                    f"Suggested canonical: '{canonical_to_apply}'."
+                )
+                row.suggestion_reason = base_reason + (f" Note: {notes}" if notes else "")
 
 def build_block_style_log_df(context: SurveyFileContext) -> Optional[pd.DataFrame]:
     """
@@ -1849,6 +1898,7 @@ def build_block_style_log_df(context: SurveyFileContext) -> Optional[pd.DataFram
 def write_output_file(
     context: SurveyFileContext,
     original_df: pd.DataFrame,
+    include_suggestions: bool = True,
 ) -> Tuple[pd.DataFrame, str, bytes]:
     """
     Build the output DataFrame with 5 columns and serialize to Excel bytes.
@@ -1870,11 +1920,15 @@ def write_output_file(
 
     translation_col_name = df_out.columns[2]
 
-    # Add new columns if missing
-    if "suggested_translation" not in df_out.columns:
-        df_out["suggested_translation"] = ""
-    if "suggestion_reason" not in df_out.columns:
-        df_out["suggestion_reason"] = ""
+    if include_suggestions:
+        # Add new columns if missing
+        if "suggested_translation" not in df_out.columns:
+            df_out["suggested_translation"] = ""
+        if "suggestion_reason" not in df_out.columns:
+            df_out["suggestion_reason"] = ""
+    else:
+        # Remove suggestion columns entirely when suggestions are disabled.
+        df_out = df_out.drop(columns=["suggested_translation", "suggestion_reason"], errors="ignore")
 
     for i, row in enumerate(context.rows):
         # Column 2: translation (existing or new)
@@ -1885,16 +1939,21 @@ def write_output_file(
         )
         df_out.at[i, translation_col_name] = final_translation
 
-        # Column 3 & 4: suggestions (if any)
-        if row.suggested_translation is not None:
-            df_out.at[i, "suggested_translation"] = row.suggested_translation
-            df_out.at[i, "suggestion_reason"] = row.suggestion_reason or ""
+        if include_suggestions:
+            # Column 3 & 4: suggestions / warnings (if any)
+            if row.suggested_translation:
+                df_out.at[i, "suggested_translation"] = row.suggested_translation
+            if row.suggestion_reason:
+                df_out.at[i, "suggestion_reason"] = row.suggestion_reason
 
     # Determine if there are any suggestions or warnings (either column)
-    has_suggestions = (
-        df_out["suggested_translation"].astype(str).str.strip().ne("").any()
-        or df_out["suggestion_reason"].astype(str).str.strip().ne("").any()
-    )
+    if include_suggestions and "suggested_translation" in df_out.columns and "suggestion_reason" in df_out.columns:
+        has_suggestions = (
+            df_out["suggested_translation"].astype(str).str.strip().ne("").any()
+            or df_out["suggestion_reason"].astype(str).str.strip().ne("").any()
+        )
+    else:
+        has_suggestions = False
 
     base_name = filename_without_extension(context.filename)
     suffix = "_translated"
@@ -1988,6 +2047,17 @@ to:
         help=(
             "After row-level QA, use a GPT model to analyze repeated English phrases and suggest "
             "canonical translations. Suggestions will remind you to check context in each case."
+        ),
+    )
+
+    provide_suggestions = st.checkbox(
+        "Provide suggestions",
+        value=True,
+        help=(
+            "When enabled, the app will QA existing translations and populate "
+            "'suggested_translation' / 'suggestion_reason'. When disabled, existing "
+            "translations are not QA'd, but the survey-level consistency pass still "
+            "runs to harmonize translations generated in this run."
         ),
     )
 
@@ -2101,7 +2171,7 @@ to:
 
                 # Create tasks
                 for row in context.rows:
-                    tasks.append(process_row_async(row, context, global_context, semaphore))
+                    tasks.append(process_row_async(row, context, global_context, semaphore, provide_suggestions))
 
                 # Run tasks and update UI incrementally
                 completed_count = 0
@@ -2136,15 +2206,37 @@ to:
 
             # Post-processing
             status_text.text("Running Consistency Pass & Style Checks...")
-            block_style_validation(context)
-            if enable_consistency:
-                consistency_pass(context)
 
-            out_df, out_filename, excel_bytes = write_output_file(context, original_df)
+            # Only do style warnings / suggestion columns when enabled
+            if provide_suggestions:
+                block_style_validation(context)
+
+            # Consistency pass should run regardless; when suggestions are OFF,
+            # apply the canonical form only to rows translated in this run.
+            if enable_consistency:
+                consistency_pass(context, apply_to_new_translations=(not provide_suggestions))
+
+            out_df, out_filename, excel_bytes = write_output_file(
+                context, original_df, include_suggestions=provide_suggestions
+            )
 
             # Calculate Stats
             n_new = sum(1 for r in context.rows if r.was_newly_translated)
-            n_sugg = sum(1 for r in context.rows if r.suggested_translation)
+            n_sugg = (
+                sum(
+                    1
+                    for r in context.rows
+                    if (r.suggested_translation or (r.suggestion_reason or "").strip())
+                )
+                if provide_suggestions
+                else 0
+            )
+            n_err = sum(
+                1
+                for r in context.rows
+                if (r.suggestion_reason or "").startswith("LLM Error")
+                or "translation likely failed" in (r.suggestion_reason or "")
+            )
 
             processed_results.append({
                 "file_name": file.name,
@@ -2152,7 +2244,7 @@ to:
                 "excel_bytes": excel_bytes,
                 "num_new_translations": n_new,
                 "num_suggestions": n_sugg,
-                "num_error_rows": 0
+                "num_error_rows": n_err
             })
 
             st.success(f"Completed {file.name}!")
