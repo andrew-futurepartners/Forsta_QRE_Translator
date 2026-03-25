@@ -53,9 +53,9 @@ def get_async_client() -> "AsyncOpenAI":
 # ==========================
 
 DEFAULT_GLOBAL_CONTEXT = (
-    "You are translating a travel & tourism market research questionnaire. "
+    "You are translating a market research questionnaire. "
     "The audience is respondents in the target locale. The text is survey content "
-    "(questions, answer options, scale labels, messages), not marketing copy."
+    "(questions, answer options, scale labels, messages)."
 )
 
 TRANSLATION_MODEL_NAME = os.getenv("TRANSLATION_MODEL", "gpt-5-mini")
@@ -162,6 +162,115 @@ LOCALE_OPTIONS = {
     ],
 }
 
+
+def build_domain_prompt_fragment(global_context: str) -> str:
+    """
+    Build a domain-context string for injection into system prompts.
+    Falls back to a generic description if global_context is empty.
+    """
+    if global_context and global_context.strip():
+        return global_context.strip()
+    return (
+        "You are translating a market research questionnaire. "
+        "The audience is survey respondents in the target locale."
+    )
+
+
+_GENDERED_LANGUAGE_CONFIG = {
+    "fr": {
+        "marker": "(e)",
+        "positive_examples": "intéressé(e), satisfait(e), employé(e), disposé(e), retraité(e), étudiant(e)",
+        "negative_examples": (
+            "probable, excellent, élevé, civil, médical, suffisant, "
+            "incapable, admirable, difficile, possible, raisonnable"
+        ),
+        "extra_rule": (
+            "CRITICAL: Do NOT add (e) to past participles used with the auxiliary 'avoir' "
+            "(e.g., 'avez mentionné', 'avez visité', 'avez indiqué'). "
+            "Past participle agreement with avoir only occurs when the direct object precedes the verb, "
+            "which is uncommon in survey questions. When in doubt, do NOT add (e) after avoir constructions."
+        ),
+    },
+    "es": {
+        "marker": "(a)",
+        "positive_examples": "interesado(a), satisfecho(a), empleado(a), jubilado(a)",
+        "negative_examples": (
+            "probable, excelente, alto, civil, médico, "
+            "incapaz, admirable, difícil, posible, razonable, importante"
+        ),
+        "extra_rule": (
+            "Do NOT add (a) to adjectives ending in -ble, -nte, or -e that are already "
+            "gender-invariable in Spanish (e.g., 'responsable', 'importante', 'independiente')."
+        ),
+    },
+    "pt": {
+        "marker": "(a)",
+        "positive_examples": "interessado(a), satisfeito(a), empregado(a), aposentado(a)",
+        "negative_examples": (
+            "provável, excelente, elevado, civil, médico, "
+            "incapaz, admirável, difícil, possível, razoável, importante"
+        ),
+        "extra_rule": (
+            "Do NOT add (a) to adjectives ending in -vel, -nte, or -e that are already "
+            "gender-invariable in Portuguese (e.g., 'responsável', 'importante', 'independente')."
+        ),
+    },
+    "it": {
+        "marker": "(a)",
+        "positive_examples": "interessato(a), soddisfatto(a), impiegato(a), pensionato(a)",
+        "negative_examples": (
+            "probabile, eccellente, elevato, civile, medico, "
+            "incapace, ammirabile, difficile, possibile, ragionevole, importante"
+        ),
+        "extra_rule": (
+            "Do NOT add (a) to adjectives ending in -bile, -nte, or -e that are already "
+            "gender-invariable in Italian (e.g., 'responsabile', 'importante', 'indipendente')."
+        ),
+    },
+    "de": {
+        "marker": "(in) or *in",
+        "positive_examples": "Angestellte(r), Rentner(in), Student(in)",
+        "negative_examples": "wahrscheinlich, ausgezeichnet, hoch, zivil",
+    },
+}
+
+
+def build_gender_inclusive_instruction(language_code: str, enabled: bool) -> str:
+    """
+    Build the gender-inclusive prompt instruction appropriate for the target language.
+    Only applies to languages with grammatical gender that affects adjective forms.
+    """
+    if not enabled:
+        return (
+            "Do NOT add parenthetical or slash-based gender variants "
+            "(e.g., '(a)', '(e)', '/a') unless the English source explicitly includes them."
+        )
+
+    lc = (language_code or "").lower()
+
+    config = None
+    for prefix, cfg in _GENDERED_LANGUAGE_CONFIG.items():
+        if lc.startswith(prefix):
+            config = cfg
+            break
+
+    if not config:
+        return ""
+
+    extra = config.get("extra_rule", "")
+    return (
+        f"GENDER-INCLUSIVE FORMS: This survey requires gender-inclusive language. "
+        f"Use the {config['marker']} notation ONLY on adjectives and past participles "
+        f"that DESCRIBE THE SURVEY RESPONDENT (the person answering). "
+        f"Correct examples: {config['positive_examples']}. "
+        f"Do NOT apply to adjectives that modify objects, concepts, costs, probabilities, "
+        f"or quality ratings. Incorrect examples: {config['negative_examples']}. "
+        f"{extra} "
+        f"RULE: If the word describes a thing rather than the respondent, do NOT add "
+        f"the inclusive marker. When in doubt, do NOT add it."
+    )
+
+
 # ==========================
 # Structural Segment Types
 # ==========================
@@ -239,7 +348,7 @@ class SurveyFileContext:
 # Structural Classification
 # ==========================
 
-def classify_segment_type(english_text: str) -> SegmentType:
+def classify_segment_type(english_text: str, variable_name: str = "") -> SegmentType:
     """
     Classify a single English survey text into a coarse structural type:
     question / instruction / answer option / scale label / other.
@@ -248,19 +357,13 @@ def classify_segment_type(english_text: str) -> SegmentType:
     to recognize specific concepts like employment status; it only cares
     about structure and length.
 
-    Improvements:
-    - Strips HTML tags before classification so HTML-wrapped questions
-      are still recognized as questions.
-    - Broader set of common instruction phrases (e.g., "Be specific",
-      "Please describe", "Provide details"), which improves behavior in
-      all target languages.
+    Uses HTML-stripped text for length checks and optionally the Forsta
+    variable name pattern to better identify answer option rows.
     """
     s = (english_text or "").strip()
     if not s:
         return SegmentType.OTHER
 
-    # Remove HTML tags for classification purposes (but do NOT modify the
-    # original text elsewhere; this is only for deciding the segment type).
     text_no_tags = re.sub(r"<[^>]+>", " ", s)
     lower = text_no_tags.lower().strip()
 
@@ -280,17 +383,26 @@ def classify_segment_type(english_text: str) -> SegmentType:
     ):
         return SegmentType.INSTRUCTION
 
-    # Short, no sentence punctuation → label-like thing: option or scale label
-    # (we use the original string here so HTML-only rows don't get mis-tagged)
-    if len(s) <= 60 and not any(p in s for p in ".?!;:"):
-        # Look for classic Likert / scale terms first (on the HTML-stripped text)
+    # Forsta variable-name pattern: qXXX,rN,cdata or qXXX,rN indicates a response option row
+    if variable_name and re.search(r',r\d+', variable_name):
+        if re.search(
+            r"(strongly|somewhat|agree|disagree|neither|satisfied|dissatisfied|"
+            r"likely|unlikely|very|extremely|poor|excellent|good|bad|fair)",
+            lower,
+        ):
+            return SegmentType.SCALE_LABEL
+        return SegmentType.ANSWER_OPTION
+
+    # Short, no sentence punctuation -> label-like thing: option or scale label
+    # Use HTML-stripped text length for a more accurate cutoff
+    stripped_len = len(text_no_tags.strip())
+    if stripped_len <= 100 and not any(p in text_no_tags for p in ".?!;:"):
         if re.search(
             r"(strongly|somewhat|agree|disagree|neither|satisfied|dissatisfied|likely|unlikely|"
             r"very|extremely|poor|excellent|good|bad|fair)",
             lower,
         ):
             return SegmentType.SCALE_LABEL
-        # Otherwise treat as generic answer option
         return SegmentType.ANSWER_OPTION
 
     # Everything else
@@ -302,7 +414,7 @@ def classify_segments(context: SurveyFileContext) -> None:
     Layer 1: assign a structural segment_type to each row in the file.
     """
     for row in context.rows:
-        row.segment_type = classify_segment_type(row.english_text)
+        row.segment_type = classify_segment_type(row.english_text, row.variable_name)
 
 def build_blocks(context: SurveyFileContext) -> List[QuestionBlock]:
     """
@@ -515,7 +627,9 @@ def is_effective_copy_of_english(english_text: str, candidate_translation: str) 
         return False
     return src == trg
 
-def should_run_copy_check(english_text: str) -> bool:
+TRANSLATABLE_SHORT_TERMS = {"none", "other", "yes", "no", "all", "any"}
+
+def should_run_copy_check(english_text: str, variable_name: str = "") -> bool:
     """
     Decide whether it makes sense to flag 'unchanged English' as a likely failure.
 
@@ -524,7 +638,7 @@ def should_run_copy_check(english_text: str) -> bool:
     normal for the English form to appear unchanged in the target language, such as:
 
       - pure numeric ranges or codes (e.g., '1970-1989', '2024'),
-      - simple proper nouns / place names (e.g., 'Riverside'),
+      - simple proper nouns / place names (e.g., 'Riverside', 'Disneyland Paris'),
       - very short single-word labels that are often the same across languages
         (e.g., 'No', 'OK').
 
@@ -533,33 +647,39 @@ def should_run_copy_check(english_text: str) -> bool:
     if not english_text:
         return False
 
-    # Strip HTML tags for the purpose of this heuristic
     text = re.sub(r"<[^>]+>", " ", english_text)
     text = text.strip()
     if not text:
         return False
 
-    # 1) Pure numeric / range / code-like content → usually safe to leave as-is
-    #    (e.g., '1970-1989', '2024', '$100', '10-15%')
     if re.fullmatch(r"[\d\s\-\–/.,%+$€£¥]+", text):
         return False
 
+    if text.lower() in TRANSLATABLE_SHORT_TERMS:
+        return True
+
     tokens = text.split()
+
+    # Multi-word proper noun heuristic: short title-cased phrases are likely
+    # brand names or place names that stay the same across languages
+    if 1 <= len(tokens) <= 5 and all(w[0].isupper() for w in tokens if w):
+        return False
+
+    # Additionally: short title-cased text in a Forsta response-option row
+    # (variable name like qXXX,rN,cdata) is almost certainly a named entity
+    if variable_name and re.search(r',r\d+', variable_name):
+        if len(tokens) <= 5 and all(w[0].isupper() for w in tokens if w):
+            return False
+
     if len(tokens) == 1:
         token = tokens[0]
 
-        # 2) Proper-noun / code-like single token:
-        #    - Starts with uppercase followed by letters/digits (e.g., 'Riverside', 'Q1'),
-        #    - OR is all caps / alphanumeric (e.g., 'USA', 'NYC').
         if re.fullmatch(r"[A-Z][A-Za-z0-9]*", token) or re.fullmatch(r"[A-Z0-9]{2,}", token):
             return False
 
-        # 3) Very short single tokens (length <= 3) are often language-invariant labels
-        #    like 'No', 'OK', etc. We avoid over-flagging these.
         if len(token) <= 3:
             return False
 
-    # For longer/multi-word texts we DO want to check for no-op translations
     return True
 
 
@@ -640,6 +760,27 @@ def adjust_capitalization_for_label(
             chars[i] = ch.upper()
             break
     return "".join(chars)
+
+
+def options_look_like_short_labels(option_texts: List[str]) -> bool:
+    """
+    Heuristic: the option set looks like short labels rather than full sentences.
+    Used to decide when peer-options guidance is helpful.
+    """
+    cleaned = [strip_html_for_heuristics(t) for t in (option_texts or [])]
+    cleaned = [t for t in cleaned if t]
+    if len(cleaned) < 2:
+        return False
+
+    punct_hits = sum(1 for t in cleaned if any(p in t for p in ".?!;:"))
+    if punct_hits / len(cleaned) > 0.2:
+        return False
+
+    avg_words = sum(len(t.split()) for t in cleaned) / len(cleaned)
+    if avg_words > 6:
+        return False
+
+    return True
 
 
 def build_translation_memory(rows: List[SurveyRow]) -> Dict[str, Dict[str, str]]:
@@ -756,27 +897,48 @@ def get_llm_client() -> "OpenAI":
     return _llm_client
 
 
+def _jaccard_word_similarity(text_a: str, text_b: str) -> float:
+    """Simple word-level Jaccard similarity."""
+    words_a = set(text_a.lower().split())
+    words_b = set(text_b.lower().split())
+    if not words_a or not words_b:
+        return 0.0
+    intersection = words_a & words_b
+    union = words_a | words_b
+    return len(intersection) / len(union) if union else 0.0
+
+
 def sample_translation_memory_examples(
     translation_memory: Dict[str, Dict[str, str]],
+    current_english: str = "",
     max_examples: int = 10,
 ) -> List[Tuple[str, str]]:
     """
-    Return up to max_examples of (english, translation) pairs from translation_memory.
+    Return up to max_examples of (english, translation) pairs from translation_memory,
+    ranked by relevance to current_english using Jaccard word similarity.
     """
     items = list(translation_memory.values())
-    examples: List[Tuple[str, str]] = []
+    candidates: List[Tuple[float, str, str]] = []
+
     for val in items:
         if isinstance(val, dict):
             eng = val.get("english", "")
             trl = val.get("translation", "")
         else:
-            # Backwards-compat, if ever a plain string sneaks in
             eng = ""
             trl = str(val)
-        if eng and trl:
-            examples.append((eng, trl))
-        if len(examples) >= max_examples:
-            break
+        if not eng or not trl:
+            continue
+
+        score = _jaccard_word_similarity(current_english, eng) if current_english else 0.0
+        candidates.append((score, eng, trl))
+
+    candidates.sort(key=lambda x: -x[0])
+
+    examples: List[Tuple[str, str]] = []
+    for _score, eng, trl in candidates[:max_examples]:
+        examples.append((eng, trl))
+
     return examples
 
 
@@ -791,13 +953,14 @@ async def call_translation_model_async(
         block_style: Optional[BlockStyle] = None,
         peer_english_options: Optional[List[str]] = None,
         parent_context: str = "",
+        gender_inclusive: bool = False,
         model_name: str = TRANSLATION_MODEL_NAME,
 ) -> Dict[str, object]:
     client = get_async_client()
     existing_translation = existing_translation or ""
 
     # 1. Memory Construction
-    memory_examples = sample_translation_memory_examples(translation_memory, max_examples=5)
+    memory_examples = sample_translation_memory_examples(translation_memory, current_english=english_text, max_examples=5)
     memory_str = "\n".join([f'- "{e}" -> "{t}"' for e, t in memory_examples]) if memory_examples else "None."
 
     # 2. Style & Context Construction
@@ -834,14 +997,21 @@ async def call_translation_model_async(
         peer_options_instruction = (
             f"Peer answer options in this same set (English, ordered): {peers_json}\n"
             "Keep this option grammatically and stylistically PARALLEL to its peers. "
-            "Do not mix label types (e.g., person-noun labels vs adjective labels) within the same set."
+            "Do not mix label types (e.g., person-noun labels vs adjective labels) within the same set. "
+            "All peer options in this set MUST use the same grammatical structure. If most peers "
+            "are infinitive phrases, this option must also be an infinitive phrase."
         )
 
+    gender_inclusive_instruction = build_gender_inclusive_instruction(
+        language_code, gender_inclusive
+    )
+
     # --------- System & User Prompts (now outside the if-block) ---------
-    system_prompt = """
-You are a professional translator and QA specialist for market-research questionnaires
-in the travel & tourism domain. You translate from English into a specified target
-language and locale.
+    domain_fragment = build_domain_prompt_fragment(global_context)
+    system_prompt = f"""
+You are a professional translator and QA specialist for market-research questionnaires.
+Domain context: {domain_fragment}
+You translate from English into a specified target language and locale.
 
 Your priorities, in order, are:
 
@@ -858,10 +1028,13 @@ Your priorities, in order, are:
    - Preserve numbers, numeric ranges, and currency symbols. You may adapt formatting
      (decimal/thousand separators, spacing) to the target locale, but the underlying
      values must stay the same.
+   - When translating currency ranges within a question, use consistent number formatting
+     appropriate for the target locale throughout the entire set of options. Do not mix
+     English-format numbers with locale-format numbers within the same question block.
 
 3. Tone and register
-   - Use a formal-neutral, polite tone appropriate for an official survey from a tourism
-     board, municipality, or research agency.
+   - Use a formal-neutral, polite tone appropriate for an official survey or research
+     instrument.
    - Avoid slang, jokes, or marketing hype. Also avoid legalese or bureaucratic jargon
      unless the English clearly uses it.
    - Aim for clear, plain language a typical adult in the target locale would understand
@@ -878,7 +1051,7 @@ Your priorities, in order, are:
    - Keep brand names, platform names and product names in their original form unless
      there is a widely used standard equivalent in the target language.
    - Do not translate internal variable names, placeholders, or piping tokens (for example:
-     {Q1}, [PIPE:DESTINATION], [[VARNAME]], $VARNAME).
+     {{Q1}}, [PIPE:DESTINATION], [[VARNAME]], $VARNAME).
 
 6. Output format
    - You MUST always return a valid JSON object with the required keys and no extra text.
@@ -901,6 +1074,8 @@ Segment metadata for this element:
 
 {peer_options_instruction}
 
+{gender_inclusive_instruction}
+
 English source text:
 \"\"\"{english_text}\"\"\"
 
@@ -920,10 +1095,19 @@ Interpretation of segment_type and block_style:
       "Enter a number", "Please describe".)
 - If segment_type = "answer_option":
     - Treat this as a stand-alone answer choice shown under a question.
-    - If block_style provides options_style (grammatical_person, phrase_form, tone),
-      use it as the style plan for this block. It is acceptable to rewrite an existing
-      translation to match this plan as long as you do NOT change the underlying meaning
-      or distinctions.
+    - You MUST follow the block_style exactly for this answer option.
+      - If grammatical_person is 'first_person' and phrase_form is 'clause': your translation
+        MUST be a first-person statement (e.g., 'Quiero ver paisajes hermosos',
+        'Je veux visiter des villes américaines', 'Voglio visitare i parchi nazionali').
+      - If phrase_form is 'noun_phrase' or 'short_phrase': your translation MUST be a noun
+        phrase or bare infinitive (e.g., 'Ver paisajes hermosos',
+        'Visiter des villes américaines', 'Visitare i parchi nazionali').
+      - Do NOT mix styles. If the plan says noun_phrase, do NOT produce a first-person clause.
+      - INCORRECT example: block_style says noun_phrase but you write 'Quiero ir de compras'
+        instead of 'Ir de compras'.
+      - CORRECT example: block_style says noun_phrase, you write 'Ir de compras'.
+    - It is acceptable to rewrite an existing translation to match this plan as long as you
+      do NOT change the underlying meaning or distinctions.
     - Keep answer options concise and parallel in style within the block (all labels or
       all self-descriptions, not a random mix), as is natural in the target language.
 - If segment_type = "scale_label":
@@ -931,12 +1115,8 @@ Interpretation of segment_type and block_style:
     - Use short, symmetric phrases that clearly express the relative position on the
       scale (from most positive to most negative or vice versa), rather than long
       sentences or self-referential statements.
-    - Do NOT add parenthetical or slash-based variants (for example masculine/feminine
-      endings like "(a)" or "/a", or multiple gender forms) unless the English source
-      explicitly includes them. Keep each label as a single, simple form.
     - When an existing translation already forms a clear, well-ordered scale, avoid
-      proposing changes that only reflect stylistic preferences (such as gender-inclusive
-      morphology or alternative but equivalent wording). Only propose changes to scale
+      proposing changes that only reflect stylistic preferences. Only propose changes to scale
       labels when they fix problems with semantics, ordering, clarity, or obvious
       unnaturalness in the target language.
 
@@ -963,7 +1143,11 @@ Instructions:
    tags and condensing whitespace, is still essentially identical to the English text, you must reconsider and
    produce a real translation in the target language.
 4. You MUST NOT change or remove any HTML tags, placeholders, or piping tokens. Only translate the text between them.
-5. Return ONLY a valid JSON object with the following keys:
+5. Style compliance check: Before returning your JSON, verify that your proposed_translation
+   matches the block_style for this segment. If grammatical_person is 'first_person' but your
+   translation does not use first-person phrasing, rewrite it. If phrase_form is 'noun_phrase'
+   but your translation is a full clause, rewrite it. This check is mandatory.
+6. Return ONLY a valid JSON object with the following keys:
    - "proposed_translation": string
    - "qa_checked_translation": string
    - "needs_change": boolean
@@ -1066,9 +1250,11 @@ def infer_style_for_block(
     }
     block_json = json.dumps(block_data, ensure_ascii=False)
 
+    domain_fragment = build_domain_prompt_fragment(global_context)
     system_prompt = (
-        "You are a professional translator and QA specialist for travel and tourism "
-        "market research questionnaires. You translate from English into the specified "
+        "You are a professional translator and QA specialist for market research questionnaires.\n"
+        f"Domain context: {domain_fragment}\n"
+        "You translate from English into the specified "
         "target language and locale. Your goal is to produce high-quality, locally natural "
         "survey text that preserves measurement properties and questionnaire structure.\n\n"
         "General requirements:\n"
@@ -1222,9 +1408,208 @@ def infer_block_styles(
     return block_styles
 
 
+async def infer_style_for_block_async(
+    context: SurveyFileContext,
+    block: QuestionBlock,
+    global_context: str,
+    semaphore: asyncio.Semaphore,
+    model_name: str = TRANSLATION_MODEL_NAME,
+) -> BlockStyle:
+    """Async version of infer_style_for_block."""
+    async with semaphore:
+        client = get_async_client()
+        rows = context.rows
+
+        def get_texts(indices: List[int]) -> List[str]:
+            texts: List[str] = []
+            for i in indices:
+                if 0 <= i < len(rows):
+                    t = (rows[i].english_text or "").strip()
+                    if t:
+                        texts.append(t)
+            return texts
+
+        question_text = " ".join(get_texts(block.question_indices))
+        instruction_texts = get_texts(block.instruction_indices)
+        option_texts = get_texts(block.answer_option_indices)
+        scale_label_texts = get_texts(block.scale_label_indices)
+
+        block_data = {
+            "block_id": block.block_id,
+            "question_text": question_text,
+            "instructions": instruction_texts,
+            "options": option_texts,
+            "scale_labels": scale_label_texts,
+        }
+        block_json = json.dumps(block_data, ensure_ascii=False)
+
+        domain_fragment = build_domain_prompt_fragment(global_context)
+        system_prompt = (
+            "You are a professional translator and QA specialist for market research questionnaires.\n"
+            f"Domain context: {domain_fragment}\n"
+            "You translate from English into the specified "
+            "target language and locale. Your goal is to produce high-quality, locally natural "
+            "survey text that preserves measurement properties and questionnaire structure.\n\n"
+            "General requirements:\n"
+            "- Use the standard variety of the target language that is appropriate for the given locale "
+            "  (for example, the variety normally used in official surveys for that country or region).\n"
+            "- Preserve the meaning of the source exactly: do not add or drop concepts, qualifiers, or exclusions.\n"
+            "- Keep tense consistent with the English text and internally consistent between question stems and "
+            "  answer options.\n"
+            "- Use terminology that is clear to a general adult audience in the target market; prefer common, "
+            "  everyday words over rare or overly technical synonyms unless the domain truly requires technical language.\n"
+            "- When translating rating scales or Likert-type items, keep the same number of points, preserve the "
+            "  direction (positive -> negative or vice versa), and choose a set of labels that are monotonic and "
+            "  stylistically consistent in the target language. Avoid mixing very formal/technical labels with casual ones "
+            "  in the same scale.\n"
+            "- For short routing or instruction texts (e.g. 'Select one', 'Select all that apply'), render them as "
+            "  complete, natural-sounding instructions in the target language (the equivalent of 'Select one option' or "
+            "  'Select all that apply') rather than fragmentary literal translations.\n"
+            "- For short, stand-alone response options (for example month names or single-word labels), follow typical "
+            "  survey label conventions for the target language: it is acceptable to capitalize them as labels (such as "
+            "  starting with an uppercase letter) even if they would normally be lowercase in running text. Do not change "
+            "  capitalization inside longer sentences.\n"
+            "- For geographic names (cities, regions, valleys, etc.), use the form that is standard in the target "
+            "  language for that locale when such a form exists; otherwise keep the original name. Do not translate "
+            "  brand or platform names such as Forsta, Decipher, or DeepL.\n"
+            "- Preserve all numbers, numeric ranges, and currency symbols exactly; adjust only the decimal/thousand "
+            "  separators and spacing according to the target locale's conventions.\n"
+            "- Preserve survey-specific markup, HTML tags, placeholders, and piping tokens exactly as they appear. "
+            "  You MUST NOT change, drop, or re-order any tags or tokens; only translate the human-readable text "
+            "  between them.\n"
+            "- When the existing translation is empty or just a copy of the English, you MUST produce a translation "
+            "  whose main human-readable content is in the target language, not in English. It is incorrect to simply "
+            "  echo the English sentence (except for proper names, brand names, and technical tokens).\n"
+            "- Any explanations you provide in the `change_reason` field must be written in English, regardless of "
+            "  the target language.\n"
+            "- Always return valid JSON with the required keys and no extra commentary."
+        )
+
+        user_prompt = f"""
+    Target language code: {context.language_code}
+    Target locale code: {context.locale_code}
+
+    Global context:
+    {global_context}
+
+    Here is one question block from the English source survey, expressed as JSON:
+    {block_json}
+
+    Guidance:
+    - Look at the English question text and the list of options to infer what kind of thing is being asked.
+    - If the options clearly describe the respondent themselves (their status, identity, situation, behavior, or attitudes),
+      and it is natural in the target locale to answer with self-descriptions, you may choose "first_person" and "clause"
+      for options. Typical English questions of this type include:
+        - "Which best describes you?"
+        - "What is your current employment status?"
+        - "Which of the following statements best applies to you?"
+    - If the options are better presented as short labels (e.g. brand names, countries, job titles, industries, or generic
+      categories that are not self-statements), prefer "third_person" or "impersonal" with "noun_phrase" or "short_phrase".
+    - Scale labels (e.g. "Very satisfied" to "Very dissatisfied") should almost always be short, symmetric phrases,
+      not full self-referential sentences. For 5-point satisfaction or evaluation scales, short phrases equivalent to
+      "Very good / Good / Neutral / Poor / Very poor" are preferred over long sentences.
+
+    Return ONLY a JSON object of the form:
+    {{
+      "block_id": <int>,
+      "options_style": {{
+        "grammatical_person": "<first_person|third_person|impersonal|unspecified>",
+        "phrase_form": "<clause|noun_phrase|short_phrase|unspecified>",
+        "tone": "<formal_neutral|casual_neutral|other>"
+      }},
+      "scale_label_style": {{
+        "phrase_form": "<short_phrase|noun_phrase|clause|unspecified>"
+      }},
+      "notes": "<short English explanation or empty string>"
+    }}
+    """
+
+        max_retries = 3
+        last_exception: Optional[Exception] = None
+
+        for attempt in range(max_retries):
+            try:
+                response = await client.chat.completions.create(
+                    model=model_name,
+                    response_format={"type": "json_object"},
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                )
+                content = response.choices[0].message.content
+                data = json.loads(content)
+
+                options_style = data.get("options_style") or {}
+                scale_style = data.get("scale_label_style") or {}
+
+                return BlockStyle(
+                    block_id=block.block_id,
+                    options_grammatical_person=options_style.get("grammatical_person", "unspecified"),
+                    options_phrase_form=options_style.get("phrase_form", "unspecified"),
+                    options_tone=options_style.get("tone", "formal_neutral"),
+                    scale_label_phrase_form=scale_style.get("phrase_form", "short_phrase"),
+                    notes=data.get("notes", "") or "",
+                )
+            except Exception as e:
+                last_exception = e
+                status_code = getattr(e, "status_code", None)
+                message = str(e).lower()
+                is_rate_limit = (status_code == 429) or ("rate limit" in message)
+                is_server_error = status_code is not None and 500 <= status_code < 600
+                if (is_rate_limit or is_server_error) and attempt < max_retries - 1:
+                    await asyncio.sleep(2 ** attempt)
+                    continue
+                break
+
+        return BlockStyle(
+            block_id=block.block_id,
+            options_grammatical_person="unspecified",
+            options_phrase_form="unspecified",
+            options_tone="formal_neutral",
+            scale_label_phrase_form="short_phrase",
+            notes=f"Style inference failed: {last_exception}",
+        )
+
+
+async def infer_block_styles_async(
+    context: SurveyFileContext,
+    global_context: str,
+    semaphore: asyncio.Semaphore,
+    model_name: str = TRANSLATION_MODEL_NAME,
+) -> Dict[int, BlockStyle]:
+    """Async version of infer_block_styles. Fires all block inferences concurrently."""
+    block_styles: Dict[int, BlockStyle] = {}
+
+    if not context.blocks:
+        context.block_styles = block_styles
+        return block_styles
+
+    tasks = []
+    blocks_to_infer = []
+
+    for block in context.blocks:
+        if block.answer_option_indices or block.scale_label_indices:
+            tasks.append(
+                infer_style_for_block_async(context, block, global_context, semaphore, model_name)
+            )
+            blocks_to_infer.append(block)
+
+    if tasks:
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        for block, result in zip(blocks_to_infer, results):
+            if isinstance(result, BlockStyle):
+                block_styles[block.block_id] = result
+
+    context.block_styles = block_styles
+    return block_styles
+
+
 def call_consistency_model(
     context: SurveyFileContext,
     phrase_groups: List[Dict[str, object]],
+    global_context: str = "",
     model_name: str = CONSISTENCY_MODEL_NAME,
 ) -> List[Dict[str, object]]:
     """
@@ -1254,9 +1639,11 @@ def call_consistency_model(
 
     groups_json = json.dumps(phrase_groups, ensure_ascii=False)
 
+    domain_fragment = build_domain_prompt_fragment(global_context)
     system_prompt = (
-        "You are a localization QA and terminology consistency specialist for travel and tourism "
-        "market research questionnaires. You review translated survey text in the target language "
+        "You are a localization QA and terminology consistency specialist for market research questionnaires.\n"
+        f"Domain context: {domain_fragment}\n"
+        "You review translated survey text in the target language "
         "and recommend when the same English phrase should use a single canonical translation.\n\n"
         "Key requirements:\n"
         "- Respect the specified target language and locale.\n"
@@ -1356,8 +1743,7 @@ def extract_placeholder_tokens(text: str) -> List[str]:
     patterns = [
         r'\{[^}]+\}',      # {placeholder}
         r'\[[^\]]+\]',     # [placeholder]
-        r'<[^>]+>',        # <tag> or <% piping %>
-        r'\$\w+',          # $VARNAME
+        r'\$[A-Z][A-Z_]+',  # $VARNAME (uppercase, 2+ chars -- excludes $25, $150)
         r'\[\[\w+\]\]',    # [[VARNAME]]
     ]
     for pat in patterns:
@@ -1404,6 +1790,41 @@ def validate_translation_structure(english_text: str, translation_text: str) -> 
 
     return True, ""
 
+
+def attempt_placeholder_repair(english_text: str, translation: str) -> str:
+    """
+    If the translation is missing placeholder tokens from the English source,
+    attempt to re-insert them at the most likely position.
+
+    Handles [TOKEN], {TOKEN}, and [[TOKEN]] patterns. Language-agnostic.
+    """
+    eng_placeholders = re.findall(r'\[\[[^\]]+\]\]|\[[A-Z_]+\]|\{[A-Z_]+\}', english_text)
+    repaired = translation
+
+    for placeholder in eng_placeholders:
+        if placeholder not in repaired:
+            # Look for a gap where the LLM translated around the placeholder
+            # (e.g., "avec , quelle" where the placeholder was dropped)
+            gap_pattern = r'(\S)\s{0,2},\s+(?=\S)'
+            gap_match = re.search(gap_pattern, repaired)
+            if gap_match:
+                insert_pos = gap_match.start() + len(gap_match.group(1))
+                repaired = repaired[:insert_pos] + f" {placeholder}" + repaired[insert_pos:]
+            else:
+                # Fallback: find the placeholder's position in English and mirror
+                # roughly the same proportional position in the translation
+                eng_idx = english_text.find(placeholder)
+                if eng_idx >= 0 and len(english_text) > 0:
+                    ratio = eng_idx / len(english_text)
+                    insert_pos = int(ratio * len(repaired))
+                    # Snap to nearest word boundary
+                    while insert_pos < len(repaired) and repaired[insert_pos] not in ' \t':
+                        insert_pos += 1
+                    repaired = repaired[:insert_pos] + f" {placeholder}" + repaired[insert_pos:]
+
+    return repaired
+
+
 # ==========================
 # Block-level Style QA
 # ==========================
@@ -1418,42 +1839,40 @@ def get_first_person_regexes(language_code: str) -> List[re.Pattern]:
     patterns: List[str] = []
     if lc.startswith("en"):
         patterns = [
-            r"\bi\b",
-            r"\bi'm\b",
-            r"\bi am\b",
-            r"\bi’ve\b",
-            r"\bi'd\b",
+            r"\bi\b", r"\bi'm\b", r"\bi am\b", r"\bi've\b", r"\bi'd\b",
+            r"\bmy\b", r"\bmyself\b",
         ]
     elif lc.startswith("es"):
         patterns = [
-            r"\byo\b",
-            r"\bsoy\b",
-            r"\bestoy\b",
-            r"\btrabajo\b",
-            r"\btengo\b",
+            r"\byo\b", r"\bsoy\b", r"\bestoy\b", r"\btrabajo\b", r"\btengo\b",
+            r"\bme\s+\w+", r"\bme\b", r"\bmí\b", r"\bmi\b", r"\bmis\b",
         ]
     elif lc.startswith("fr"):
         patterns = [
-            r"\bje\b",
-            r"\bj['’]",     # j'...
-            r"\bje suis\b",
+            r"\bje\b", r"\bj['\u2019']", r"\bje suis\b",
+            r"\bje me\b", r"\bje m['\u2019']",
+            r"\bme\b", r"\bm['\u2019]",
+            r"\bs['\u2019']est\b",
+            r"\bma\b", r"\bmon\b", r"\bmes\b",
         ]
     elif lc.startswith("pt"):
         patterns = [
-            r"\beu\b",
-            r"\bsou\b",
-            r"\bestou\b",
-            r"\btrabalho\b",
+            r"\beu\b", r"\bsou\b", r"\bestou\b", r"\btrabalho\b",
+            r"\bme\s+\w+", r"\bme\b", r"\bmeu\b", r"\bminha\b",
+            r"\bmeus\b", r"\bminhas\b",
         ]
     elif lc.startswith("de"):
         patterns = [
-            r"\bich\b",
-            r"\bich bin\b",
+            r"\bich\b", r"\bich bin\b",
+            r"\bmein\b", r"\bmeine\b", r"\bmeinem\b",
+            r"\bmeinen\b", r"\bmeiner\b", r"\bmeines\b",
+            r"\bmich\b", r"\bmir\b",
         ]
     elif lc.startswith("it"):
         patterns = [
-            r"\bio\b",
-            r"\bsono\b",
+            r"\bio\b", r"\bsono\b",
+            r"\bmi\b", r"\bmi\s+\w+", r"\bmio\b", r"\bmia\b",
+            r"\bmiei\b", r"\bmie\b",
         ]
 
     return [re.compile(pat, re.IGNORECASE) for pat in patterns]
@@ -1467,6 +1886,7 @@ def detect_option_style_pattern(
     Roughly classify an answer option translation as:
       - 'first_person_like'
       - 'short_label_like'
+      - 'noun_phrase_like'
       - 'other'
     This is heuristic and only used for QA/warnings.
     """
@@ -1476,14 +1896,18 @@ def detect_option_style_pattern(
 
     lower = s.lower()
 
-    # First-person-like?
     for regex in get_first_person_regexes(language_code):
         if regex.search(lower):
             return "first_person_like"
 
-    # Short label-like: short text, no sentence punctuation
-    if len(s) <= 60 and not any(p in s for p in ".?!;:"):
+    # Threshold aligned with classify_segment_type (100 chars on stripped text)
+    if len(s) <= 100 and not any(p in s for p in ".?!;:"):
         return "short_label_like"
+
+    # Longer text without question/exclamation marks -- typically multi-clause
+    # answer options, long descriptions, or concern statements
+    if len(s) <= 200 and not any(p in s for p in "?!"):
+        return "noun_phrase_like"
 
     return "other"
 
@@ -1534,13 +1958,17 @@ def block_style_validation(context: SurveyFileContext) -> None:
 
                 if counts:
                     majority_pattern = max(counts, key=counts.get)
-                    # Only warn when the majority pattern is informative
-                    if majority_pattern in {"first_person_like", "short_label_like"}:
+                    if majority_pattern in {"first_person_like", "short_label_like", "noun_phrase_like"}:
                         for idx, pat in zip(option_indices, option_patterns):
+                            # noun_phrase_like and short_label_like are compatible
+                            compatible = (
+                                {pat, majority_pattern} <= {"short_label_like", "noun_phrase_like"}
+                            )
                             if (
                                 pat != majority_pattern
                                 and pat != "unknown"
                                 and pat != "other"
+                                and not compatible
                             ):
                                 row = rows[idx]
                                 msg = (
@@ -1592,6 +2020,7 @@ async def process_row_async(
         global_context: str,
         semaphore: asyncio.Semaphore,
         provide_suggestions: bool,
+        gender_inclusive: bool = False,
 ) -> SurveyRow:
     # Acquire slot in the semaphore (e.g., max 20 active requests)
     async with semaphore:
@@ -1661,7 +2090,8 @@ async def process_row_async(
             segment_type=row.segment_type,
             block_style=context.block_styles.get(row.block_id) if row.block_id is not None else None,
             peer_english_options=peer_english_options,
-            parent_context=parent_context_str
+            parent_context=parent_context_str,
+            gender_inclusive=gender_inclusive,
         )
 
         # --- Process Result (Same logic as before, just adapted for async return) ---
@@ -1669,21 +2099,19 @@ async def process_row_async(
 
         is_ok, msg = validate_translation_structure(eng_text, proposed)
         if not is_ok:
-            # keep existing (or English if it was placeholder)
-            base = row.existing_translation or eng_text
-            row.new_translation = base
-            row.suggested_translation = base  # or leave blank; depends on your UX
+            repaired = attempt_placeholder_repair(eng_text, proposed)
+            if repaired and repaired != proposed:
+                re_valid, _ = validate_translation_structure(eng_text, repaired)
+                if re_valid:
+                    proposed = repaired
+                    is_ok = True
+
+        if not is_ok:
             row.suggestion_reason = ((row.suggestion_reason + " | ") if row.suggestion_reason else "") + \
                                     f"Structure validation warning: {msg}"
-            return row
 
-        # Safety: if there was no prior real translation and the model's output is
-        # effectively just the English again, treat this as a likely failure and flag it.
-        # BUT only run this check for texts that clearly ought to be translated
-        # (multi-word phrases, questions, longer labels). For simple numeric ranges,
-        # proper nouns, or very short one-word labels, it's often correct for the
-        # target-language form to match the English.
-        if (not result.get("error")) and (not row.had_real_translation) and should_run_copy_check(eng_text):
+        # Copy check must run regardless of structure validation outcome.
+        if (not result.get("error")) and (not row.had_real_translation) and should_run_copy_check(eng_text, variable_name=row.variable_name):
             if is_effective_copy_of_english(eng_text, proposed):
                 base = row.existing_translation or eng_text
                 row.new_translation = base
@@ -1693,9 +2121,14 @@ async def process_row_async(
                     + "Model output is effectively identical to the English source; "
                       "translation likely failed. Please review/translate this row manually."
                 )
-                # Do NOT continue to treat this as a successful translation.
                 return row
 
+        # If structure validation failed and copy check didn't fire, fall back now.
+        if not is_ok:
+            base = row.existing_translation or eng_text
+            row.new_translation = base
+            row.suggested_translation = proposed
+            return row
 
         if result.get("error"):
             row.suggestion_reason = f"LLM Error: {result.get('change_reason')}"
@@ -1704,6 +2137,13 @@ async def process_row_async(
             # New Translation
             row.new_translation = adjust_capitalization_for_label(eng_text, proposed, context.language_code)
             row.was_newly_translated = True
+            existing = (row.existing_translation or "").strip()
+            if existing and existing.lower() == eng_text.strip().lower():
+                snippet = existing[:80]
+                row.suggestion_reason = (
+                    (row.suggestion_reason or "")
+                    + f"Copy check: existing translation was identical to English source ('{snippet}'). Retranslated."
+                )
         else:
             # QA Existing
             row.new_translation = row.existing_translation
@@ -1716,7 +2156,93 @@ async def process_row_async(
         return row
 
 
-def consistency_pass(context: SurveyFileContext, apply_to_new_translations: bool = False) -> None:
+async def restyle_mismatched_rows(
+    context: SurveyFileContext,
+    global_context: str,
+    semaphore: asyncio.Semaphore,
+    gender_inclusive: bool = False,
+) -> int:
+    """
+    Post-translation style re-check.
+
+    For each question block, check that all answer options match the inferred
+    block style. Re-translate any that don't match. Returns count of re-translated rows.
+    """
+    if not context.blocks or not context.block_styles:
+        return 0
+
+    retranslated = 0
+    lang = context.language_code or ""
+
+    for block in context.blocks:
+        style = context.block_styles.get(block.block_id)
+        if not style:
+            continue
+        if not block.answer_option_indices:
+            continue
+
+        person = style.options_grammatical_person or "unspecified"
+        phrase = style.options_phrase_form or "unspecified"
+        if person == "unspecified" and phrase == "unspecified":
+            continue
+
+        if style.options_grammatical_person == "first_person":
+            expected_pattern = "first_person_like"
+        elif style.options_phrase_form in ("noun_phrase", "short_phrase"):
+            expected_pattern = "short_label_like"
+        else:
+            continue
+
+        for idx in block.answer_option_indices:
+            if idx < 0 or idx >= len(context.rows):
+                continue
+            row = context.rows[idx]
+            trl = (row.new_translation or row.existing_translation or "").strip()
+            if not trl:
+                continue
+
+            actual_pattern = detect_option_style_pattern(trl, lang)
+
+            if actual_pattern != expected_pattern and actual_pattern != "unknown":
+                # noun_phrase_like is compatible with short_label_like (just longer)
+                if actual_pattern == "noun_phrase_like" and expected_pattern == "short_label_like":
+                    continue
+
+                async with semaphore:
+                    result = await call_translation_model_async(
+                        english_text=row.english_text,
+                        language_code=context.language_code,
+                        locale_code=context.locale_code,
+                        global_context=global_context,
+                        translation_memory=context.translation_memory,
+                        existing_translation=trl,
+                        segment_type=row.segment_type,
+                        block_style=style,
+                        parent_context=" ".join(
+                            context.rows[i].english_text
+                            for i in block.question_indices
+                            if context.rows[i].english_text
+                        ),
+                        gender_inclusive=gender_inclusive,
+                    )
+
+                new_trl = result.get("qa_checked_translation") or result.get("proposed_translation") or ""
+                if new_trl and new_trl != trl:
+                    new_pattern = detect_option_style_pattern(new_trl, lang)
+                    if new_pattern == expected_pattern or new_pattern == "unknown":
+                        row.new_translation = new_trl
+                        retranslated += 1
+                    else:
+                        row.suggestion_reason = (
+                            (row.suggestion_reason or "") +
+                            " | Style re-check: could not align this option to the "
+                            f"block style ({expected_pattern}). Manual review recommended."
+                        )
+
+    return retranslated
+
+
+def consistency_pass(context: SurveyFileContext, apply_to_new_translations: bool = False, global_context: str = "") -> None:
     """
     Survey-wide consistency pass (LLM-powered) using Fuzzy Matching.
 
@@ -1776,7 +2302,7 @@ def consistency_pass(context: SurveyFileContext, apply_to_new_translations: bool
         return  # nothing to do
 
     # Ask the LLM to decide canonical translations and which indices to update
-    issues = call_consistency_model(context, phrase_groups)
+    issues = call_consistency_model(context, phrase_groups, global_context=global_context)
 
     # Lookup so we can see all indices/translations for an english_phrase
     group_lookup = {g["english_phrase"]: g for g in phrase_groups}
@@ -1845,6 +2371,10 @@ def consistency_pass(context: SurveyFileContext, apply_to_new_translations: bool
                     f"Suggested canonical: '{canonical_to_apply}'."
                 )
                 row.suggestion_reason = base_reason + (f" Note: {notes}" if notes else "")
+
+                # Auto-apply to freshly translated rows for output consistency
+                if row.new_translation and not row.had_real_translation:
+                    row.new_translation = canonical_to_apply
 
 def build_block_style_log_df(context: SurveyFileContext) -> Optional[pd.DataFrame]:
     """
@@ -1961,6 +2491,14 @@ def write_output_file(
         suffix += "_WITH_SUGGESTIONS"
     output_filename = base_name + suffix + ".xlsx"
 
+    # Sanitize all string cells to strip control characters openpyxl rejects
+    from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
+    for col in df_out.columns:
+        if df_out[col].dtype == object:
+            df_out[col] = df_out[col].apply(
+                lambda v: ILLEGAL_CHARACTERS_RE.sub("", v) if isinstance(v, str) else v
+            )
+
     # Serialize to Excel in memory, with an extra sheet for block-level style logs (Layer 4)
     buffer = io.BytesIO()
     with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
@@ -1970,6 +2508,11 @@ def write_output_file(
         # Optional style log sheet
         style_log_df = build_block_style_log_df(context)
         if style_log_df is not None and not style_log_df.empty:
+            for col in style_log_df.columns:
+                if style_log_df[col].dtype == object:
+                    style_log_df[col] = style_log_df[col].apply(
+                        lambda v: ILLEGAL_CHARACTERS_RE.sub("", v) if isinstance(v, str) else v
+                    )
             style_log_df.to_excel(writer, index=False, sheet_name="__style_log")
 
     buffer.seek(0)
@@ -2121,11 +2664,22 @@ to:
                 code for (label, code) in locale_options if label == selected_locale_label
             )
 
+            gender_inclusive = st.checkbox(
+                f"Enable gender-inclusive forms for {filename}",
+                value=(language_code == "fr"),
+                help=(
+                    "When enabled, the model will add gender-inclusive forms "
+                    "(e.g., intéressé(e) in French) to adjective-based labels."
+                ),
+                key=f"gender_{filename}",
+            )
+
         file_configs.append(
             {
                 "file": file,
                 "language_code": language_code,
                 "locale_code": locale_code,
+                "gender_inclusive": gender_inclusive,
             }
         )
 
@@ -2141,17 +2695,17 @@ to:
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
 
-        processed_results = []
+        st.session_state["processed_results"] = []
 
         for cfg in file_configs:
             file = cfg["file"]
             file.seek(0)
             context, original_df = load_forsta_export(file, cfg["language_code"], cfg["locale_code"])
+            gender_inclusive = cfg.get("gender_inclusive", False)
 
-            # Pre-processing layers
+            # Pre-processing layers (sync)
             classify_segments(context)
             build_blocks(context)
-            infer_block_styles(context, global_context)  # Still sync, but fast enough
 
             st.subheader(f"Processing: {file.name}")
             progress_bar = st.progress(0.0)
@@ -2159,19 +2713,23 @@ to:
 
             # LIVE PREVIEW SETUP
             st.caption("Live Activity Log (Showing last 5 processed rows)")
-            live_table_placeholder = st.empty()  # <--- CHANGE 1: Use empty() instead of container()
+            live_table_placeholder = st.empty()
             preview_data = []
 
             # SEMAPHORE: Control parallelism (e.g., 15 concurrent requests)
             semaphore = asyncio.Semaphore(15)
 
             async def run_file_processing():
+                # Async style inference (Layer 3)
+                status_text.text("Inferring block styles...")
+                await infer_block_styles_async(context, global_context, semaphore)
+
                 tasks = []
                 total_rows = len(context.rows)
 
                 # Create tasks
                 for row in context.rows:
-                    tasks.append(process_row_async(row, context, global_context, semaphore, provide_suggestions))
+                    tasks.append(process_row_async(row, context, global_context, semaphore, provide_suggestions, gender_inclusive=gender_inclusive))
 
                 # Run tasks and update UI incrementally
                 completed_count = 0
@@ -2201,6 +2759,12 @@ to:
                             hide_index=True
                         )
 
+                # Post-translation style re-check
+                status_text.text("Running style re-check...")
+                restyle_count = await restyle_mismatched_rows(context, global_context, semaphore, gender_inclusive=gender_inclusive)
+                if restyle_count:
+                    status_text.text(f"Style re-check: {restyle_count} rows re-translated for style alignment.")
+
             # Execute the async loop
             loop.run_until_complete(run_file_processing())
 
@@ -2214,7 +2778,7 @@ to:
             # Consistency pass should run regardless; when suggestions are OFF,
             # apply the canonical form only to rows translated in this run.
             if enable_consistency:
-                consistency_pass(context, apply_to_new_translations=(not provide_suggestions))
+                consistency_pass(context, apply_to_new_translations=(not provide_suggestions), global_context=global_context)
 
             out_df, out_filename, excel_bytes = write_output_file(
                 context, original_df, include_suggestions=provide_suggestions
@@ -2238,18 +2802,30 @@ to:
                 or "translation likely failed" in (r.suggestion_reason or "")
             )
 
-            processed_results.append({
+            result = {
                 "file_name": file.name,
                 "out_filename": out_filename,
                 "excel_bytes": excel_bytes,
                 "num_new_translations": n_new,
                 "num_suggestions": n_sugg,
-                "num_error_rows": n_err
-            })
+                "num_error_rows": n_err,
+            }
+
+            # Immediately persist to session state so the download survives
+            # even if a later file errors out
+            st.session_state["processed_results"].append(result)
 
             st.success(f"Completed {file.name}!")
 
-        st.session_state["processed_results"] = processed_results
+            # Render a download button right away so the user doesn't have to
+            # wait for remaining files
+            st.download_button(
+                label=f"Download: {out_filename}",
+                data=excel_bytes,
+                file_name=out_filename,
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key=f"download_inline_{file.name}",
+            )
 
     # After possible run, render download buttons from cached results
     processed_results: List[Dict[str, object]] = st.session_state.get("processed_results", [])
