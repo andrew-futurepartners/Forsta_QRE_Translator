@@ -71,6 +71,8 @@ LANGUAGE_NAME_TO_CODE = {
     "italian": "it",
     "japanese": "ja",
     "chinese": "zh",
+    "dutch": "nl",
+    "korean": "ko",
 }
 
 # For UI labels
@@ -83,6 +85,8 @@ LANGUAGE_LABEL_TO_CODE = {
     "Italian": "it",
     "Japanese": "ja",
     "Chinese": "zh",
+    "Dutch": "nl",
+    "Korean": "ko",
 }
 
 # Locale mappings (focus on Spanish + English as requested)
@@ -159,6 +163,14 @@ LOCALE_OPTIONS = {
         ("Chinese (Simplified, zh-CN)", "zh-CN"),
         ("Chinese (Traditional, zh-TW)", "zh-TW"),
         ("Chinese (Hong Kong, zh-HK)", "zh-HK"),
+    ],
+    "nl": [
+        ("Generic Dutch (no specific country)", "nl"),
+        ("Netherlands (nl-NL)", "nl-NL"),
+        ("Belgium / Flemish (nl-BE)", "nl-BE"),
+    ],
+    "ko": [
+        ("South Korea (ko-KR)", "ko-KR"),
     ],
 }
 
@@ -303,6 +315,8 @@ class SurveyRow:
     segment_type: SegmentType = SegmentType.OTHER
     # Layer 2: block membership (question + options group)
     block_id: Optional[int] = None
+    # True if this row was translated as part of a batch scale call
+    batch_translated: bool = False
 
 @dataclass
 class QuestionBlock:
@@ -475,6 +489,44 @@ def build_blocks(context: SurveyFileContext) -> List[QuestionBlock]:
     # Persist on context for future layers (style inference, block-level QA)
     context.blocks = blocks
     return blocks
+
+
+def promote_scale_labels(context: SurveyFileContext) -> None:
+    """
+    Post-classification pass: when a block already contains >= 2 SCALE_LABEL
+    items, reclassify any remaining ANSWER_OPTION items in the same block as
+    SCALE_LABEL.  This fixes splits where some items in the same Likert-type
+    scale lack trigger keywords (e.g. "Much more comfortable" has no keyword
+    but "Somewhat more comfortable" does).
+
+    Only short, label-like answer options are promoted — long or sentence-like
+    options are left alone.
+    """
+    if not context.blocks:
+        return
+
+    for block in context.blocks:
+        if len(block.scale_label_indices) < 2:
+            continue
+        if not block.answer_option_indices:
+            continue
+
+        indices_to_promote: List[int] = []
+        for idx in block.answer_option_indices:
+            if idx < 0 or idx >= len(context.rows):
+                continue
+            row = context.rows[idx]
+            text = re.sub(r"<[^>]+>", " ", (row.english_text or "")).strip()
+            if len(text) <= 100 and not any(p in text for p in ".?!;:"):
+                indices_to_promote.append(idx)
+
+        for idx in indices_to_promote:
+            context.rows[idx].segment_type = SegmentType.SCALE_LABEL
+            block.answer_option_indices.remove(idx)
+            block.scale_label_indices.append(idx)
+
+        block.scale_label_indices.sort()
+
 
 def filename_without_extension(filename: str) -> str:
     return Path(filename).stem
@@ -1110,6 +1162,17 @@ Interpretation of segment_type and block_style:
       do NOT change the underlying meaning or distinctions.
     - Keep answer options concise and parallel in style within the block (all labels or
       all self-descriptions, not a random mix), as is natural in the target language.
+    - COMPOUND OPTIONS: When an answer option contains an em-dash (\u2014), en-dash (\u2013),
+      colon (:), or similar separator joining two distinct clauses, apply grammatical
+      person to each clause independently based on the ENGLISH SOURCE TEXT:
+      * The opt-out or categorical label part (e.g., "None of the above", "Other")
+        should remain impersonal.
+      * If the English source clause uses first-person pronouns (I, my, me, myself),
+        that clause MUST be translated in first person REGARDLESS of block_style.
+        This overrides block_style for that clause only.
+      Example: English "None of the above \u2014 I do not use AI tools to plan travel"
+      \u2192 Italian "Nessuna delle precedenti \u2014 Non utilizzo strumenti di IA per
+      pianificare i viaggi" (first-person "utilizzo", NOT third-person "utilizza").
 - If segment_type = "scale_label":
     - Treat this as a label on a rating scale (e.g., satisfaction, agreement).
     - Use short, symmetric phrases that clearly express the relative position on the
@@ -1208,6 +1271,251 @@ Your response:
         "qa_checked_translation": existing_translation,
         "needs_change": False,
     }
+
+
+async def translate_scale_batch_async(
+    context: SurveyFileContext,
+    block: QuestionBlock,
+    global_context: str,
+    semaphore: asyncio.Semaphore,
+    provide_suggestions: bool,
+    gender_inclusive: bool = False,
+    model_name: str = TRANSLATION_MODEL_NAME,
+    translated_question_context: str = "",
+) -> int:
+    """
+    Translate all scale labels in a block in a single LLM call so the model
+    can produce a coherent, symmetric set of translations.
+
+    Returns the number of rows that were successfully batch-translated.
+    On failure, leaves batch_translated=False on all rows so they fall
+    through to the row-by-row path.
+    """
+    if not block.scale_label_indices:
+        return 0
+
+    rows = context.rows
+    scale_indices = [i for i in block.scale_label_indices if 0 <= i < len(rows)]
+    if len(scale_indices) < 2:
+        return 0
+
+    english_labels = []
+    existing_translations = []
+    all_have_real_translation = True
+    any_have_real_translation = False
+
+    for idx in scale_indices:
+        row = rows[idx]
+        eng = (row.english_text or "").strip()
+        english_labels.append(eng)
+
+        if row.had_real_translation:
+            existing_translations.append((row.existing_translation or "").strip())
+            any_have_real_translation = True
+        else:
+            existing_translations.append("")
+            all_have_real_translation = False
+
+    # If all labels already have real translations and suggestions are disabled, skip.
+    if all_have_real_translation and not provide_suggestions:
+        for idx in scale_indices:
+            rows[idx].new_translation = rows[idx].existing_translation
+            rows[idx].batch_translated = True
+        return len(scale_indices)
+
+    # Build question context
+    q_texts = [
+        rows[i].english_text for i in block.question_indices
+        if 0 <= i < len(rows) and rows[i].english_text
+    ]
+    question_context = " ".join(q_texts)
+
+    # Block style
+    block_style = None
+    if context.block_styles:
+        block_style = context.block_styles.get(block.block_id)
+    scale_phrase_form = getattr(block_style, "scale_label_phrase_form", "short_phrase")
+
+    # Translation memory examples (use the combined English labels for relevance)
+    combined_english = " ".join(english_labels)
+    memory_examples = sample_translation_memory_examples(
+        context.translation_memory, current_english=combined_english, max_examples=5
+    )
+    memory_str = "\n".join(
+        [f'- "{e}" -> "{t}"' for e, t in memory_examples]
+    ) if memory_examples else "None."
+
+    gender_inclusive_instruction = build_gender_inclusive_instruction(
+        context.language_code, gender_inclusive
+    )
+
+    labels_json = json.dumps(english_labels, ensure_ascii=False)
+    existing_json = json.dumps(existing_translations, ensure_ascii=False)
+
+    domain_fragment = build_domain_prompt_fragment(global_context)
+    system_prompt = f"""You are a professional translator for market-research questionnaires.
+Domain context: {domain_fragment}
+You translate rating-scale label sets from English into a specified target language and locale.
+
+Your priorities:
+1. Translate ALL labels as a single coherent scale — the set must be symmetric,
+   monotonic, and use consistent vocabulary and grammatical structure throughout.
+2. Use short, natural phrases appropriate for survey scale labels in the target locale.
+   Avoid long sentences or self-referential statements.
+3. Preserve scale polarity and intensity (e.g., if the English goes from very positive
+   to very negative, the target language set must do the same).
+4. Preserve all HTML tags, placeholders, and piping tokens exactly.
+5. Respect translation memory examples when they fit.
+6. The 'notes' field MUST always be written in ENGLISH.
+7. Return ONLY a valid JSON object with the required keys and no extra text."""
+
+    if all_have_real_translation:
+        task_instruction = (
+            "All labels already have existing translations. Review them as a SET for "
+            "consistency, symmetry, and naturalness. If they already form a clear, "
+            "well-ordered scale, return them unchanged. Only propose changes when there "
+            "are problems with consistency across the set, semantic accuracy, ordering, "
+            "clarity, or obvious unnaturalness."
+        )
+    elif any_have_real_translation:
+        task_instruction = (
+            "Some labels have existing translations and some do not (shown as empty strings). "
+            "Fill in the missing translations so they match the style and vocabulary of "
+            "the existing ones, forming a coherent set. You may also adjust existing "
+            "translations if needed for set-wide consistency."
+        )
+    else:
+        task_instruction = (
+            "None of these labels have been translated yet. Produce a complete, coherent "
+            "set of translations that form a natural rating scale in the target language."
+        )
+
+    translated_q_section = ""
+    if translated_question_context:
+        translated_q_section = (
+            f'\nTranslated question (target language):\n'
+            f'"""{translated_question_context}"""\n\n'
+            f'IMPORTANT: Your scale label translations MUST use vocabulary that is\n'
+            f'semantically consistent with the translated question above. If the\n'
+            f'question uses a specific word for the concept being measured (e.g.,\n'
+            f'"comfortable", "satisfied", "likely"), your scale labels must echo\n'
+            f'that same word or word family — do NOT use a different synonym.'
+        )
+
+    user_prompt = f"""Target language code: {context.language_code}
+Target locale code: {context.locale_code}
+
+Global survey context:
+{global_context}
+
+Question this scale belongs to (English):
+\"\"\"{question_context}\"\"\"
+{translated_q_section}
+
+Scale label style: phrase_form = {scale_phrase_form}
+
+{gender_inclusive_instruction}
+
+English scale labels (ordered):
+{labels_json}
+
+Existing translations (ordered, empty string means no translation yet):
+{existing_json}
+
+Translation memory examples (English -> target translation):
+{memory_str}
+
+Task:
+{task_instruction}
+
+Return ONLY a JSON object:
+{{
+  "translations": ["<label_1>", "<label_2>", ...],
+  "needs_changes": [true/false, true/false, ...],
+  "notes": "<short English explanation of approach>"
+}}
+
+CRITICAL: The "translations" array MUST have exactly {len(english_labels)} elements,
+one for each English label, in the same order."""
+
+    async with semaphore:
+        client = get_async_client()
+        for attempt in range(3):
+            try:
+                response = await client.chat.completions.create(
+                    model=model_name,
+                    response_format={"type": "json_object"},
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                )
+                data = json.loads(response.choices[0].message.content)
+                translations = data.get("translations", [])
+
+                if not isinstance(translations, list) or len(translations) != len(scale_indices):
+                    raise ValueError(
+                        f"Expected {len(scale_indices)} translations, got {len(translations)}"
+                    )
+
+                needs_changes = data.get("needs_changes", [True] * len(translations))
+                if not isinstance(needs_changes, list) or len(needs_changes) != len(translations):
+                    needs_changes = [True] * len(translations)
+
+                notes = data.get("notes", "")
+
+                translated_count = 0
+                for i, idx in enumerate(scale_indices):
+                    row = rows[idx]
+                    proposed = (translations[i] or "").strip()
+                    if not proposed:
+                        continue
+
+                    eng = (row.english_text or "").strip()
+                    proposed = adjust_capitalization_for_label(eng, proposed, context.language_code)
+
+                    is_ok, msg = validate_translation_structure(eng, proposed)
+                    if not is_ok:
+                        repaired = attempt_placeholder_repair(eng, proposed)
+                        if repaired and repaired != proposed:
+                            re_valid, _ = validate_translation_structure(eng, repaired)
+                            if re_valid:
+                                proposed = repaired
+                                is_ok = True
+                        if not is_ok:
+                            row.suggestion_reason = (
+                                (row.suggestion_reason or "") +
+                                f"Batch scale structure warning: {msg}"
+                            )
+                            continue
+
+                    if not row.had_real_translation:
+                        row.new_translation = proposed
+                        row.was_newly_translated = True
+                    else:
+                        row.new_translation = row.existing_translation
+                        if needs_changes[i] and proposed != row.existing_translation:
+                            if provide_suggestions:
+                                row.suggested_translation = proposed
+                                detail = notes if notes else "adjusted for set consistency"
+                                row.suggestion_reason = (
+                                    (row.suggestion_reason or "") +
+                                    f"Batch scale review: {detail}."
+                                )
+                            else:
+                                row.new_translation = proposed
+
+                    row.batch_translated = True
+                    translated_count += 1
+
+                return translated_count
+
+            except Exception as e:
+                if attempt == 2:
+                    return 0
+                await asyncio.sleep(2 ** attempt)
+
+    return 0
 
 
 def infer_style_for_block(
@@ -2022,6 +2330,9 @@ async def process_row_async(
         provide_suggestions: bool,
         gender_inclusive: bool = False,
 ) -> SurveyRow:
+    if row.batch_translated:
+        return row
+
     # Acquire slot in the semaphore (e.g., max 20 active requests)
     async with semaphore:
         eng_text = (row.english_text or "").strip()
@@ -2161,18 +2472,26 @@ async def restyle_mismatched_rows(
     global_context: str,
     semaphore: asyncio.Semaphore,
     gender_inclusive: bool = False,
+    provide_suggestions: bool = True,
 ) -> int:
     """
     Post-translation style re-check.
 
     For each question block, check that all answer options match the inferred
     block style. Re-translate any that don't match. Returns count of re-translated rows.
+
+    When *provide_suggestions* is False, rows that already had a real (non-English-
+    placeholder) translation are skipped — they were kept as-is during the main
+    pass, so spending an LLM call to restyle them is unnecessary.
     """
     if not context.blocks or not context.block_styles:
         return 0
 
-    retranslated = 0
     lang = context.language_code or ""
+
+    # -- Phase 1: collect every mismatched row that needs an LLM restyle call --
+    tasks = []
+    task_meta: list[tuple] = []  # parallel list: (row, expected_pattern) per task
 
     for block in context.blocks:
         style = context.block_styles.get(block.block_id)
@@ -2193,10 +2512,20 @@ async def restyle_mismatched_rows(
         else:
             continue
 
+        parent_context = " ".join(
+            context.rows[i].english_text
+            for i in block.question_indices
+            if context.rows[i].english_text
+        )
+
         for idx in block.answer_option_indices:
             if idx < 0 or idx >= len(context.rows):
                 continue
             row = context.rows[idx]
+
+            if not provide_suggestions and row.had_real_translation:
+                continue
+
             trl = (row.new_translation or row.existing_translation or "").strip()
             if not trl:
                 continue
@@ -2204,40 +2533,54 @@ async def restyle_mismatched_rows(
             actual_pattern = detect_option_style_pattern(trl, lang)
 
             if actual_pattern != expected_pattern and actual_pattern != "unknown":
-                # noun_phrase_like is compatible with short_label_like (just longer)
                 if actual_pattern == "noun_phrase_like" and expected_pattern == "short_label_like":
                     continue
 
-                async with semaphore:
-                    result = await call_translation_model_async(
-                        english_text=row.english_text,
-                        language_code=context.language_code,
-                        locale_code=context.locale_code,
-                        global_context=global_context,
-                        translation_memory=context.translation_memory,
-                        existing_translation=trl,
-                        segment_type=row.segment_type,
-                        block_style=style,
-                        parent_context=" ".join(
-                            context.rows[i].english_text
-                            for i in block.question_indices
-                            if context.rows[i].english_text
-                        ),
-                        gender_inclusive=gender_inclusive,
-                    )
-
-                new_trl = result.get("qa_checked_translation") or result.get("proposed_translation") or ""
-                if new_trl and new_trl != trl:
-                    new_pattern = detect_option_style_pattern(new_trl, lang)
-                    if new_pattern == expected_pattern or new_pattern == "unknown":
-                        row.new_translation = new_trl
-                        retranslated += 1
-                    else:
-                        row.suggestion_reason = (
-                            (row.suggestion_reason or "") +
-                            " | Style re-check: could not align this option to the "
-                            f"block style ({expected_pattern}). Manual review recommended."
+                async def _restyle_one(
+                    _sem=semaphore, _row=row, _trl=trl, _style=style,
+                    _parent_ctx=parent_context,
+                ):
+                    async with _sem:
+                        return await call_translation_model_async(
+                            english_text=_row.english_text,
+                            language_code=context.language_code,
+                            locale_code=context.locale_code,
+                            global_context=global_context,
+                            translation_memory=context.translation_memory,
+                            existing_translation=_trl,
+                            segment_type=_row.segment_type,
+                            block_style=_style,
+                            parent_context=_parent_ctx,
+                            gender_inclusive=gender_inclusive,
                         )
+
+                tasks.append(_restyle_one())
+                task_meta.append((row, expected_pattern))
+
+    if not tasks:
+        return 0
+
+    # -- Phase 2: fire all LLM calls concurrently (semaphore throttles) --
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    retranslated = 0
+    for (row, expected_pattern), result in zip(task_meta, results):
+        if isinstance(result, Exception):
+            continue
+
+        new_trl = result.get("qa_checked_translation") or result.get("proposed_translation") or ""
+        trl = (row.new_translation or row.existing_translation or "").strip()
+        if new_trl and new_trl != trl:
+            new_pattern = detect_option_style_pattern(new_trl, lang)
+            if new_pattern == expected_pattern or new_pattern == "unknown":
+                row.new_translation = new_trl
+                retranslated += 1
+            else:
+                row.suggestion_reason = (
+                    (row.suggestion_reason or "") +
+                    " | Style re-check: could not align this option to the "
+                    f"block style ({expected_pattern}). Manual review recommended."
+                )
 
     return retranslated
 
@@ -2666,7 +3009,7 @@ to:
 
             gender_inclusive = st.checkbox(
                 f"Enable gender-inclusive forms for {filename}",
-                value=(language_code == "fr"),
+                value=False,
                 help=(
                     "When enabled, the model will add gender-inclusive forms "
                     "(e.g., intéressé(e) in French) to adjective-based labels."
@@ -2706,6 +3049,7 @@ to:
             # Pre-processing layers (sync)
             classify_segments(context)
             build_blocks(context)
+            promote_scale_labels(context)
 
             st.subheader(f"Processing: {file.name}")
             progress_bar = st.progress(0.0)
@@ -2724,10 +3068,102 @@ to:
                 status_text.text("Inferring block styles...")
                 await infer_block_styles_async(context, global_context, semaphore)
 
+                # Batch-translate scale labels (one LLM call per block)
+                if context.blocks:
+                    # Pre-translate question rows for blocks with scales so the
+                    # scale batch call can align vocabulary with the translated stem.
+                    scale_blocks = [
+                        b for b in context.blocks
+                        if b.scale_label_indices and len(b.scale_label_indices) >= 2
+                    ]
+                    if scale_blocks:
+                        status_text.text("Pre-translating question stems for scale blocks...")
+                        q_tasks = []
+                        q_block_map: Dict[int, List[int]] = {}
+                        for block in scale_blocks:
+                            q_indices = [
+                                i for i in block.question_indices
+                                if 0 <= i < len(context.rows) and (context.rows[i].english_text or "").strip()
+                            ]
+                            if q_indices:
+                                q_block_map[block.block_id] = q_indices
+                                for qi in q_indices:
+                                    qrow = context.rows[qi]
+                                    if qrow.had_real_translation and not provide_suggestions:
+                                        qrow.new_translation = qrow.existing_translation
+                                        qrow.batch_translated = True
+                                    else:
+                                        q_tasks.append(
+                                            call_translation_model_async(
+                                                english_text=qrow.english_text,
+                                                language_code=context.language_code,
+                                                locale_code=context.locale_code,
+                                                global_context=global_context,
+                                                translation_memory=context.translation_memory,
+                                                existing_translation=qrow.existing_translation if qrow.had_real_translation else None,
+                                                segment_type=qrow.segment_type,
+                                                block_style=context.block_styles.get(qrow.block_id) if qrow.block_id is not None else None,
+                                                gender_inclusive=gender_inclusive,
+                                            )
+                                        )
+                        if q_tasks:
+                            q_results = await asyncio.gather(*q_tasks, return_exceptions=True)
+                            result_iter = iter(q_results)
+                            for block in scale_blocks:
+                                for qi in q_block_map.get(block.block_id, []):
+                                    qrow = context.rows[qi]
+                                    if qrow.batch_translated:
+                                        continue
+                                    result = next(result_iter)
+                                    if isinstance(result, Exception):
+                                        continue
+                                    proposed = result.get("qa_checked_translation") or result.get("proposed_translation") or ""
+                                    if not proposed:
+                                        continue
+                                    eng = (qrow.english_text or "").strip()
+                                    is_ok, _ = validate_translation_structure(eng, proposed)
+                                    if not is_ok:
+                                        repaired = attempt_placeholder_repair(eng, proposed)
+                                        if repaired:
+                                            re_ok, _ = validate_translation_structure(eng, repaired)
+                                            if re_ok:
+                                                proposed = repaired
+                                                is_ok = True
+                                    if not qrow.had_real_translation:
+                                        qrow.new_translation = proposed
+                                        qrow.was_newly_translated = True
+                                    else:
+                                        qrow.new_translation = qrow.existing_translation
+                                        if result.get("needs_change") and proposed != qrow.existing_translation:
+                                            if provide_suggestions:
+                                                qrow.suggested_translation = proposed
+                                                qrow.suggestion_reason = result.get("change_reason", "")
+                                            else:
+                                                qrow.new_translation = proposed
+                                    qrow.batch_translated = True
+
+                    status_text.text("Translating scale labels...")
+                    scale_tasks = []
+                    for block in scale_blocks:
+                        translated_q = " ".join(
+                            (context.rows[i].new_translation or context.rows[i].existing_translation or "")
+                            for i in block.question_indices
+                            if 0 <= i < len(context.rows)
+                        ).strip()
+                        scale_tasks.append(
+                            translate_scale_batch_async(
+                                context, block, global_context, semaphore,
+                                provide_suggestions, gender_inclusive=gender_inclusive,
+                                translated_question_context=translated_q,
+                            )
+                        )
+                    if scale_tasks:
+                        await asyncio.gather(*scale_tasks, return_exceptions=True)
+
                 tasks = []
                 total_rows = len(context.rows)
 
-                # Create tasks
+                # Create tasks (batch-translated rows will return immediately)
                 for row in context.rows:
                     tasks.append(process_row_async(row, context, global_context, semaphore, provide_suggestions, gender_inclusive=gender_inclusive))
 
@@ -2761,7 +3197,11 @@ to:
 
                 # Post-translation style re-check
                 status_text.text("Running style re-check...")
-                restyle_count = await restyle_mismatched_rows(context, global_context, semaphore, gender_inclusive=gender_inclusive)
+                restyle_count = await restyle_mismatched_rows(
+                    context, global_context, semaphore,
+                    gender_inclusive=gender_inclusive,
+                    provide_suggestions=provide_suggestions,
+                )
                 if restyle_count:
                     status_text.text(f"Style re-check: {restyle_count} rows re-translated for style alignment.")
 
@@ -2817,15 +3257,22 @@ to:
 
             st.success(f"Completed {file.name}!")
 
-            # Render a download button right away so the user doesn't have to
-            # wait for remaining files
-            st.download_button(
-                label=f"Download: {out_filename}",
-                data=excel_bytes,
-                file_name=out_filename,
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                key=f"download_inline_{file.name}",
-            )
+            # Render download in a fragment so clicking it won't cancel the
+            # processing loop for remaining files.
+            _dl_idx = len(st.session_state["processed_results"]) - 1
+
+            @st.fragment
+            def _inline_download(idx=_dl_idx):
+                res = st.session_state["processed_results"][idx]
+                st.download_button(
+                    label=f"Download: {res['out_filename']}",
+                    data=res["excel_bytes"],
+                    file_name=res["out_filename"],
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key=f"download_inline_{res['file_name']}",
+                )
+
+            _inline_download()
 
     # After possible run, render download buttons from cached results
     processed_results: List[Dict[str, object]] = st.session_state.get("processed_results", [])
@@ -2837,37 +3284,41 @@ to:
     st.markdown("---")
     st.subheader("Download processed files")
 
-    for res in processed_results:
-        st.success(
-            f"Finished processing `{res['file_name']}`. "
-            f"New translations (former English placeholders): {res['num_new_translations']} | "
-            f"Rows with suggestions/warnings: {res['num_suggestions']} | "
-            f"Rows with LLM errors: {res['num_error_rows']}"
-        )
+    @st.fragment
+    def _render_downloads():
+        results = st.session_state.get("processed_results", [])
+        for res in results:
+            st.success(
+                f"Finished processing `{res['file_name']}`. "
+                f"New translations (former English placeholders): {res['num_new_translations']} | "
+                f"Rows with suggestions/warnings: {res['num_suggestions']} | "
+                f"Rows with LLM errors: {res['num_error_rows']}"
+            )
 
-        st.download_button(
-            label=f"Download processed file: {res['out_filename']}",
-            data=res["excel_bytes"],
-            file_name=res["out_filename"],
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            key=f"download_{res['file_name']}",
-        )
+            st.download_button(
+                label=f"Download processed file: {res['out_filename']}",
+                data=res["excel_bytes"],
+                file_name=res["out_filename"],
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key=f"download_{res['file_name']}",
+            )
 
-    # Optional: one-click "download all" as a ZIP when there are multiple files
-    if len(processed_results) > 1:
-        zip_buffer = io.BytesIO()
-        with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
-            for res in processed_results:
-                zf.writestr(res["out_filename"], res["excel_bytes"])
-        zip_buffer.seek(0)
+        if len(results) > 1:
+            zip_buffer = io.BytesIO()
+            with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+                for res in results:
+                    zf.writestr(res["out_filename"], res["excel_bytes"])
+            zip_buffer.seek(0)
 
-        st.download_button(
-            label="Download ALL processed files as ZIP",
-            data=zip_buffer.getvalue(),
-            file_name="processed_translations.zip",
-            mime="application/zip",
-            key="download_all_zip",
-        )
+            st.download_button(
+                label="Download ALL processed files as ZIP",
+                data=zip_buffer.getvalue(),
+                file_name="processed_translations.zip",
+                mime="application/zip",
+                key="download_all_zip",
+            )
+
+    _render_downloads()
 
 
 if __name__ == "__main__":
