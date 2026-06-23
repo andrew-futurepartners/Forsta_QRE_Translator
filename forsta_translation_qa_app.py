@@ -73,6 +73,7 @@ LANGUAGE_NAME_TO_CODE = {
     "chinese": "zh",
     "dutch": "nl",
     "korean": "ko",
+    "hindi": "hi",
 }
 
 # For UI labels
@@ -87,6 +88,7 @@ LANGUAGE_LABEL_TO_CODE = {
     "Chinese": "zh",
     "Dutch": "nl",
     "Korean": "ko",
+    "Hindi": "hi",
 }
 
 # Locale mappings (focus on Spanish + English as requested)
@@ -109,8 +111,21 @@ ENGLISH_LOCALE_NAME_TO_BCP47 = {
     "us": "en-US",
     "united_states": "en-US",
     "canada": "en-CA",
+    "ca": "en-CA",
     "australia": "en-AU",
+    "aus": "en-AU",
+    "au": "en-AU",
     "en": "en",
+}
+
+# Shorthand tokens that imply English + a specific locale when they appear
+# as the language segment in the filename (e.g., 260306_uk.xls).
+_ENGLISH_LOCALE_SHORTHANDS = {
+    "uk": "en-GB",
+    "gb": "en-GB",
+    "aus": "en-AU",
+    "au": "en-AU",
+    "ca": "en-CA",
 }
 
 # Common locale options per language (for UI dropdowns)
@@ -172,7 +187,195 @@ LOCALE_OPTIONS = {
     "ko": [
         ("South Korea (ko-KR)", "ko-KR"),
     ],
+    "hi": [
+        ("Generic Hindi (no specific country)", "hi"),
+        ("India (hi-IN)", "hi-IN"),
+    ],
 }
+
+# ==========================
+# Dialect Adaptation Dictionaries
+# ==========================
+
+# Per-locale vocabulary whitelist: only these US->local substitutions are
+# permitted.  Terms NOT listed here must be left unchanged by the LLM.
+# Phrase-level entries (multi-word keys) are checked before single-word entries.
+DIALECT_VOCABULARY: Dict[str, Dict[str, str]] = {
+    "en-GB": {
+        # Phrase-level (checked first)
+        "in line": "in a queue",
+        # Single-word
+        "vacation": "holiday",
+        "vacations": "holidays",
+        "airplane": "aeroplane",
+        "airplanes": "aeroplanes",
+        "transportation": "transport",
+    },
+    "en-AU": {
+        "in line": "in a queue",
+        "vacation": "holiday",
+        "vacations": "holidays",
+        "airplane": "aeroplane",
+        "airplanes": "aeroplanes",
+        "transportation": "transport",
+    },
+    "en-CA": {
+        # CA uses "vacation" (NOT "holiday"), does NOT convert -ize/-ise.
+        # Phrase-level mappings for adjective-form geographic terms:
+        "state park": "provincial park",
+        "state parks": "provincial parks",
+        "state fair": "provincial fair",
+        "state fairs": "provincial fairs",
+        "state/county": "provincial/county",
+        "national, state,": "national, provincial,",
+    },
+}
+
+# Deterministic spelling corrections applied as a post-processing regex pass.
+# Keyed by locale code; each value is a list of (US_word, local_word) tuples.
+# Applied with word-boundary matching and case-preservation.
+_DIALECT_SPELLING_UKAU: List[Tuple[str, str]] = [
+    # -eling / -elling
+    ("traveling", "travelling"),
+    ("traveled", "travelled"),
+    ("traveler", "traveller"),
+    ("travelers", "travellers"),
+    # -er / -re
+    ("center", "centre"),
+    ("centers", "centres"),
+    # -or / -our
+    ("neighborhood", "neighbourhood"),
+    ("neighborhoods", "neighbourhoods"),
+    ("color", "colour"),
+    ("colors", "colours"),
+    ("favor", "favour"),
+    ("favors", "favours"),
+    ("favorite", "favourite"),
+    ("favorites", "favourites"),
+    ("honor", "honour"),
+    ("honors", "honours"),
+    ("behavior", "behaviour"),
+    ("behaviors", "behaviours"),
+    ("humor", "humour"),
+    ("labor", "labour"),
+    # -ce / -se
+    ("practiced", "practised"),
+    ("practicing", "practising"),
+    ("defense", "defence"),
+    ("offense", "offence"),
+    ("license", "licence"),
+    # -ize / -ise  (UK/AU only — NOT CA)
+    ("organize", "organise"),
+    ("organizes", "organises"),
+    ("organized", "organised"),
+    ("organizing", "organising"),
+    ("recognize", "recognise"),
+    ("recognizes", "recognises"),
+    ("recognized", "recognised"),
+    ("recognizing", "recognising"),
+    ("localize", "localise"),
+    ("localizes", "localises"),
+    ("localized", "localised"),
+    ("localizing", "localising"),
+    ("customize", "customise"),
+    ("customized", "customised"),
+    ("prioritize", "prioritise"),
+    ("prioritized", "prioritised"),
+    ("specialize", "specialise"),
+    ("specialized", "specialised"),
+    ("maximize", "maximise"),
+    ("minimize", "minimise"),
+    # -ization / -isation
+    ("organization", "organisation"),
+    ("organizations", "organisations"),
+    ("localization", "localisation"),
+    ("customization", "customisation"),
+    ("specialization", "specialisation"),
+    # misc
+    ("gray", "grey"),
+    ("analog", "analogue"),
+    ("canceled", "cancelled"),
+    ("canceling", "cancelling"),
+]
+
+# CA shares some UK/AU spelling but NOT -ize/-ise, NOT practiced, NOT color/favour
+_DIALECT_SPELLING_CA: List[Tuple[str, str]] = [
+    ("traveling", "travelling"),
+    ("traveled", "travelled"),
+    ("traveler", "traveller"),
+    ("travelers", "travellers"),
+    ("center", "centre"),
+    ("centers", "centres"),
+    ("neighborhood", "neighbourhood"),
+    ("neighborhoods", "neighbourhoods"),
+    ("canceled", "cancelled"),
+    ("canceling", "cancelling"),
+]
+
+DIALECT_SPELLING: Dict[str, List[Tuple[str, str]]] = {
+    "en-GB": _DIALECT_SPELLING_UKAU,
+    "en-AU": _DIALECT_SPELLING_UKAU,
+    "en-CA": _DIALECT_SPELLING_CA,
+}
+
+
+def _case_preserving_replace(match: re.Match, replacement: str) -> str:
+    """Replace with the same capitalization pattern as the matched text."""
+    word = match.group(0)
+    if word.isupper():
+        return replacement.upper()
+    if word[0].isupper():
+        return replacement[0].upper() + replacement[1:]
+    return replacement
+
+
+def apply_dialect_spelling_corrections(context: "SurveyFileContext") -> int:
+    """
+    Deterministic post-processing pass: apply regex-based spelling corrections
+    for the target dialect.  Catches any conversions the LLM missed.
+    Skips content inside HTML tags and placeholder tokens.
+
+    Returns the number of rows modified.
+    """
+    locale = context.locale_code
+    corrections = DIALECT_SPELLING.get(locale, [])
+    if not corrections:
+        return 0
+
+    # Pre-compile patterns (case-insensitive, word-boundary)
+    compiled = [
+        (re.compile(r'\b' + re.escape(us) + r'\b', re.IGNORECASE), local)
+        for us, local in corrections
+    ]
+
+    fixed = 0
+    for row in context.rows:
+        if row.batch_translated:
+            continue
+        trl = row.new_translation or ""
+        if not trl.strip():
+            continue
+
+        original = trl
+
+        # Split on HTML tags / placeholders so we only touch visible text
+        parts = re.split(r'(<[^>]+>|\{[^}]+\}|\[[^\]]+\])', trl)
+        for i, part in enumerate(parts):
+            if part.startswith(('<', '{', '[')):
+                continue
+            for pattern, replacement in compiled:
+                part = pattern.sub(
+                    lambda m, r=replacement: _case_preserving_replace(m, r),
+                    part,
+                )
+            parts[i] = part
+
+        new_trl = "".join(parts)
+        if new_trl != original:
+            row.new_translation = new_trl
+            fixed += 1
+
+    return fixed
 
 
 def build_domain_prompt_fragment(global_context: str) -> str:
@@ -247,6 +450,54 @@ _GENDERED_LANGUAGE_CONFIG = {
 }
 
 
+def build_brand_name_instruction(language_code: str) -> str:
+    """
+    For CJK languages, instruct the LLM to keep English brand names
+    and add a local-language reading aid in parentheses.
+    """
+    lc = (language_code or "").lower()
+    CJK_PREFIXES = {"ja", "ko", "zh"}
+
+    if not any(lc.startswith(p) for p in CJK_PREFIXES):
+        return ""
+
+    return (
+        "BRAND NAMES: For well-known technology brand names and product names "
+        "(e.g., ChatGPT, Copilot, Claude, Gemini), keep the original English name "
+        "and add the local-language reading in parentheses. "
+        "Example for Japanese: 'Copilot(コパイロット)', 'Claude(クロード)'. "
+        "Do NOT fully transliterate brand names into the target script."
+    )
+
+
+def build_list_context_instruction(
+    answer_option_count: int,
+    answer_option_avg_len: float,
+    language_code: str,
+) -> str:
+    """
+    For list-like blocks (many short options, e.g. country lists),
+    instruct the LLM to omit definite articles for consistency.
+    """
+    if answer_option_count < 10:
+        return ""
+    if answer_option_avg_len > 40:
+        return ""
+
+    lc = (language_code or "").lower()
+    ARTICLE_LANGUAGES = {"fr", "pt", "es", "it", "de", "nl"}
+
+    if not any(lc.startswith(prefix) for prefix in ARTICLE_LANGUAGES):
+        return ""
+
+    return (
+        "LIST FORMAT: These items appear in a dropdown list or selection set. "
+        "Do NOT add definite articles (le, la, les, o, a, os, as, el, los, il, der, die, das, de, het) "
+        "before names. Use the bare name only for consistency within the list. "
+        "Example: 'Bahamas' not 'Les Bahamas', 'Gambie' not 'La Gambie'."
+    )
+
+
 def build_gender_inclusive_instruction(language_code: str, enabled: bool) -> str:
     """
     Build the gender-inclusive prompt instruction appropriate for the target language.
@@ -267,7 +518,12 @@ def build_gender_inclusive_instruction(language_code: str, enabled: bool) -> str
             break
 
     if not config:
-        return ""
+        return (
+            "GENDER-INCLUSIVE FORMS: Use locale-appropriate gender-inclusive language where "
+            "standard practice in the target language. Do not add slash-based or parenthetical "
+            "gender variants (e.g., '(e)', '/a') unless the English source explicitly includes them "
+            "or there is a well-established convention for this language."
+        )
 
     extra = config.get("extra_rule", "")
     return (
@@ -352,6 +608,9 @@ class SurveyFileContext:
     blocks: Optional[List[QuestionBlock]] = None
     # Layer 3: style plan per question block
     block_styles: Optional[Dict[int, BlockStyle]] = None
+    # True when source and target are both the same language but different locales
+    # (e.g. en → en-GB, en → en-CA). Gates copy-check bypass and localization prompts.
+    is_same_language_localization: bool = False
 
 
 # ==========================
@@ -381,6 +640,20 @@ def classify_segment_type(english_text: str, variable_name: str = "") -> Segment
     text_no_tags = re.sub(r"<[^>]+>", " ", s)
     lower = text_no_tags.lower().strip()
 
+    # PRIORITY 1: Forsta variable-name pattern (structural signal overrides text heuristics).
+    # qXXX,rN,cdata or qXXX,rN reliably indicates a response option row regardless of
+    # what the English text looks like (e.g. "What to expect at..." is still an option).
+    if variable_name and re.search(r',r\d+', variable_name):
+        if re.search(
+            r"\b(strongly|somewhat|agree|disagree|neither|satisfied|dissatisfied|"
+            r"likely|unlikely|very|extremely|poor|excellent|good|bad|fair)\b",
+            lower,
+        ):
+            return SegmentType.SCALE_LABEL
+        return SegmentType.ANSWER_OPTION
+
+    # PRIORITY 2: Text-based heuristics (only when no variable-name signal).
+
     # Likely question: visible text ends with '?' or starts with a question-like phrase
     if text_no_tags.rstrip().endswith("?") or re.match(
         r"^(how|what|which|when|where|who|do you|did you|have you|to what extent|please rate|on a scale)\b",
@@ -397,23 +670,13 @@ def classify_segment_type(english_text: str, variable_name: str = "") -> Segment
     ):
         return SegmentType.INSTRUCTION
 
-    # Forsta variable-name pattern: qXXX,rN,cdata or qXXX,rN indicates a response option row
-    if variable_name and re.search(r',r\d+', variable_name):
-        if re.search(
-            r"(strongly|somewhat|agree|disagree|neither|satisfied|dissatisfied|"
-            r"likely|unlikely|very|extremely|poor|excellent|good|bad|fair)",
-            lower,
-        ):
-            return SegmentType.SCALE_LABEL
-        return SegmentType.ANSWER_OPTION
-
     # Short, no sentence punctuation -> label-like thing: option or scale label
     # Use HTML-stripped text length for a more accurate cutoff
     stripped_len = len(text_no_tags.strip())
     if stripped_len <= 100 and not any(p in text_no_tags for p in ".?!;:"):
         if re.search(
-            r"(strongly|somewhat|agree|disagree|neither|satisfied|dissatisfied|likely|unlikely|"
-            r"very|extremely|poor|excellent|good|bad|fair)",
+            r"\b(strongly|somewhat|agree|disagree|neither|satisfied|dissatisfied|likely|unlikely|"
+            r"very|extremely|poor|excellent|good|bad|fair)\b",
             lower,
         ):
             return SegmentType.SCALE_LABEL
@@ -528,6 +791,54 @@ def promote_scale_labels(context: SurveyFileContext) -> None:
         block.scale_label_indices.sort()
 
 
+# Resource prefixes for rows that must be skipped in dialect adaptation mode.
+# These are hidden/system fields or US-only question blocks that are
+# conditionally invisible to international respondents.
+# Every row whose Resource starts with one of these prefixes is skipped
+# (title, comment, ch## answer options, etc.)
+_DIALECT_SKIP_BLOCK_PREFIXES = (
+    "qZipCode",
+    "qZipState",
+    "qZipDivision",
+    "qZipRegion",
+    "qZipMarket",
+    "qState",
+    "vRESPDATA",
+    "vHHINCOMELABELS",
+)
+
+
+def skip_dialect_excluded_rows(context: SurveyFileContext) -> int:
+    """
+    Pre-processing filter for dialect adaptation mode.  Marks rows that must
+    NOT be adapted (hidden system fields, US-only question blocks) so they
+    pass through with source text unchanged.
+
+    Returns the number of rows skipped.
+    """
+    skipped = 0
+    for row in context.rows:
+        resource = (row.variable_name or "")
+
+        # Check resource prefix against the skip list
+        if any(resource.startswith(pfx) for pfx in _DIALECT_SKIP_BLOCK_PREFIXES):
+            row.new_translation = row.english_text
+            row.batch_translated = True
+            skipped += 1
+            continue
+
+        # Check for HIDDEN marker in visible text (strip HTML first)
+        src = (row.english_text or "").strip()
+        src_no_html = re.sub(r"<[^>]+>", " ", src).strip()
+        if src_no_html.upper().startswith("HIDDEN"):
+            row.new_translation = row.english_text
+            row.batch_translated = True
+            skipped += 1
+            continue
+
+    return skipped
+
+
 def filename_without_extension(filename: str) -> str:
     return Path(filename).stem
 
@@ -606,6 +917,9 @@ def parse_language_and_locale_from_filename(filename: str) -> Tuple[str, str]:
     Parse filenames like:
       12345_Spanish_Argentina.xlsx
       12345_English_UK.csv
+      12345_English_CA.xls
+      12345_uk.xls              (shorthand: implies English + en-GB)
+      12345_aus.xls             (shorthand: implies English + en-AU)
       <survey_id>_<language>[_<localization>].ext
 
     Returns (language_code, locale_code), empty string when detection fails.
@@ -617,6 +931,14 @@ def parse_language_and_locale_from_filename(filename: str) -> Tuple[str, str]:
     locale_name = parts[2] if len(parts) >= 3 else None
 
     language_code = map_language_name_to_code(language_name)
+
+    # Shorthand fallback: if the language token itself is a known English locale
+    # abbreviation (e.g., "uk", "aus", "ca"), treat it as English + that locale.
+    if not language_code and language_name:
+        shorthand_locale = _ENGLISH_LOCALE_SHORTHANDS.get(language_name.strip().lower())
+        if shorthand_locale:
+            return "en", shorthand_locale
+
     locale_code = map_language_and_locale_to_bcp47(language_code, locale_name) if language_code else ""
 
     return language_code, locale_code
@@ -627,9 +949,15 @@ def read_excel_or_csv(file) -> pd.DataFrame:
     suffix = Path(filename).suffix.lower()
 
     if suffix in [".xls", ".xlsx"]:
-        df = pd.read_excel(file)
+        df = pd.read_excel(file, keep_default_na=False, na_values=[""])
     elif suffix == ".csv":
-        df = pd.read_csv(file)
+        try:
+            df = pd.read_csv(file, encoding="utf-8-sig", sep=None, engine="python",
+                             keep_default_na=False, na_values=[""])
+        except UnicodeDecodeError:
+            file.seek(0)
+            df = pd.read_csv(file, encoding="cp1252", sep=None, engine="python",
+                             keep_default_na=False, na_values=[""])
     else:
         raise ValueError(f"Unsupported file type for {filename}. Use .xls, .xlsx, or .csv")
 
@@ -761,7 +1089,7 @@ def is_label_like_english(text: str) -> bool:
     We use this to optionally adjust capitalization of the translation for
     answer options, without touching full sentences.
     """
-    s = (text or "").strip()
+    s = strip_html_for_heuristics(text or "")
     if not s:
         return False
     if len(s) > 40:
@@ -802,8 +1130,8 @@ def adjust_capitalization_for_label(
     if not is_label_like_english(english_text):
         return translation_text
 
-    # Languages without case (e.g. Japanese, Chinese) – do nothing
-    if language_code in {"ja", "zh"}:
+    # Languages without case (e.g. Japanese, Chinese, Korean, Hindi) – do nothing
+    if language_code in {"ja", "zh", "ko", "hi"}:
         return translation_text
 
     chars = list(translation_text)
@@ -920,6 +1248,10 @@ def load_forsta_export(
         translation_memory={},  # filled next
     )
     context.translation_memory = build_translation_memory(context.rows)
+    context.is_same_language_localization = (
+        language_code == "en"
+        and locale_code not in ("en", "en-US", "")
+    )
     return context, df
 
 
@@ -1007,6 +1339,9 @@ async def call_translation_model_async(
         parent_context: str = "",
         gender_inclusive: bool = False,
         model_name: str = TRANSLATION_MODEL_NAME,
+        answer_option_count: int = 0,
+        answer_option_avg_len: float = 0.0,
+        is_same_language_localization: bool = False,
 ) -> Dict[str, object]:
     client = get_async_client()
     existing_translation = existing_translation or ""
@@ -1019,8 +1354,10 @@ async def call_translation_model_async(
     segment_type_str = segment_type.value if isinstance(segment_type, SegmentType) else "other"
 
     # Block-level style plan (may be None)
+    # Force null for same-language localization — style-driven restructuring
+    # (first-person prefixes, phrase-form enforcement) must never apply.
     block_style_info = {}
-    if isinstance(block_style, BlockStyle):
+    if not is_same_language_localization and isinstance(block_style, BlockStyle):
         block_style_info = {
             "options_style": {
                 "grammatical_person": block_style.options_grammatical_person,
@@ -1037,9 +1374,10 @@ async def call_translation_model_async(
     context_instruction = ""
     if parent_context:
         context_instruction = (
-            f'CONTEXT ALERT: The text below is an answer option or label for this question: '
+            f"Parent question for context only (do NOT change the meaning of the answer options): "
             f'"{parent_context}".\n'
-            f"Ensure your translation fits grammatically and logically as a response to this question."
+            f"Ensure your translation fits grammatically as a response, but preserve the exact "
+            f"semantic meaning of the English answer option text."
         )
 
     peer_options_instruction = ""
@@ -1058,9 +1396,101 @@ async def call_translation_model_async(
         language_code, gender_inclusive
     )
 
+    brand_name_instruction = build_brand_name_instruction(language_code)
+
+    # Grounding instruction: prevent semantic drift in answer option translations
+    grounding_instruction = ""
+    if segment_type in (SegmentType.ANSWER_OPTION, SegmentType.SCALE_LABEL):
+        grounding_instruction = (
+            "CRITICAL: Translate the EXACT English text of each answer option literally. "
+            "Do NOT reinterpret, paraphrase, or adapt the meaning based on the question. "
+            "The English text is the authoritative source. For example, if the English says "
+            "'comfortable', translate as 'comfortable/at ease' in the target language, "
+            "NOT as 'interested' or 'willing'. Each answer option must preserve the "
+            "exact semantic meaning of its English source text."
+        )
+
+    # List-context instruction: omit articles for dropdown/list-like blocks
+    list_context_instruction = build_list_context_instruction(
+        answer_option_count, answer_option_avg_len, language_code
+    )
+
     # --------- System & User Prompts (now outside the if-block) ---------
     domain_fragment = build_domain_prompt_fragment(global_context)
-    system_prompt = f"""
+
+    # Build locale-specific vocabulary whitelist for the prompt
+    _vocab_for_locale = DIALECT_VOCABULARY.get(locale_code, {})
+    _vocab_prompt_lines = ""
+    if _vocab_for_locale:
+        _vocab_prompt_lines = "\n".join(
+            f'   "{us}" -> "{local}"'
+            for us, local in _vocab_for_locale.items()
+        )
+
+    if is_same_language_localization:
+        system_prompt = f"""
+You are a professional copy editor specializing in regional English dialect adaptation
+for market-research questionnaires.
+Domain context: {domain_fragment}
+You adapt survey text from one English dialect to another (e.g., US English to British
+English, Canadian English, or Australian English).
+
+The ONLY changes you are permitted to make are:
+1. Spelling conventions (e.g., color/colour, center/centre,
+   traveled/travelled, canceled/cancelled, defense/defence, analog/analogue).
+2. Vocabulary substitutions ONLY from the approved whitelist below. If a US term is
+   NOT in this list, leave it unchanged.
+
+APPROVED VOCABULARY WHITELIST for {locale_code}:
+{_vocab_prompt_lines if _vocab_prompt_lines else "   (No vocabulary substitutions — spelling changes only.)"}
+
+If the text is already correct for the target locale, return it UNCHANGED.
+It is expected that the majority of rows will require zero changes.
+
+You MUST NOT do any of the following:
+- Do NOT change the grammatical structure, person, or phrasing of the source text.
+  If the source says "Visited a UNESCO World Heritage Site", you must NOT add
+  "I visited..." or any other prefix. Preserve the exact grammatical form.
+- Do NOT insert, remove, or reorder words unless the change is a direct dialect
+  vocabulary substitution from the whitelist above. Do NOT add words like "that",
+  "which", or articles unless the whitelist entry includes them.
+- Do NOT change adjectives or qualifiers (e.g., do NOT change "quiet" to "quieter").
+- Do NOT rephrase, restructure, or "improve" text in any way beyond the two
+  permitted change types above.
+- Do NOT convert currency symbols, amounts, or formatting. Leave $, EUR, GBP and all
+  monetary values exactly as they appear in the source. Do NOT add comma separators
+  to currency amounts.
+- Do NOT add content that is not in the source text (e.g., do NOT add metric/km
+  equivalents, explanatory notes, or parenthetical additions).
+- Do NOT change number formatting (e.g., do NOT change "5 - 10" to "5–10").
+- Do NOT add, remove, or change any punctuation marks. Preserve the exact punctuation
+  from the source, including periods, commas, quotation marks, hyphens, dashes, and
+  ellipses. Do NOT "fix" or "correct" punctuation errors in the source text.
+- Do NOT correct errors, typos, capitalization issues, or formatting inconsistencies
+  in the source text. If the source has "District Of Columbia", output "District Of
+  Columbia" exactly. Only change words that differ between US English and the target
+  dialect per the rules above.
+- Do NOT convert "state" to "province" for UK or AU English. US geographic
+  references (state, zip code) should remain as-is unless the whitelist above
+  provides a specific conversion.
+- When a US term is used as an adjective modifying a noun (e.g., "state park"),
+  use the adjective form of the local equivalent ("provincial park"), not the noun
+  form ("province park").
+
+Structural safety:
+- Do NOT change, remove, or re-order any HTML tags, placeholders, survey piping tokens
+  or variable names. Only adapt the human-readable text between them.
+
+Consistency:
+- When the same phrase appears in multiple places, prefer consistent adaptation.
+- Respect any adaptations shown in the translation memory.
+
+Output format:
+- You MUST always return a valid JSON object with the required keys and no extra text.
+- The 'change_reason' field MUST always be written in ENGLISH.
+"""
+    else:
+        system_prompt = f"""
 You are a professional translator and QA specialist for market-research questionnaires.
 Domain context: {domain_fragment}
 You translate from English into a specified target language and locale.
@@ -1085,12 +1515,18 @@ Your priorities, in order, are:
      English-format numbers with locale-format numbers within the same question block.
 
 3. Tone and register
-   - Use a formal-neutral, polite tone appropriate for an official survey or research
-     instrument.
-   - Avoid slang, jokes, or marketing hype. Also avoid legalese or bureaucratic jargon
-     unless the English clearly uses it.
-   - Aim for clear, plain language a typical adult in the target locale would understand
-     on first read.
+   - This is a survey for general consumers. Use standard, accessible language that any
+     adult respondent can read without effort.
+   - Avoid slang, jokes, or marketing hype. Also avoid legal/formal register (e.g., use
+     the equivalent of 'live' rather than 'reside', 'airports' rather than 'airport hubs').
+   - Do NOT add politeness markers (e.g., 'please', 'Por favor') to instruction text
+     unless the English source explicitly includes them.
+   - Use natural, idiomatic phrasing that a native speaker would use in everyday language.
+     When a common English expression has a well-known idiomatic equivalent in the target
+     language, prefer the idiomatic form (e.g., the equivalent of 'trips abroad' rather
+     than a literal 'international voyages').
+   - Target the register of a well-written consumer survey, not a legal document or
+     institutional report.
 
 4. Consistency and terminology
    - When the same English phrase appears in multiple places with the same meaning, you
@@ -1104,12 +1540,62 @@ Your priorities, in order, are:
      there is a widely used standard equivalent in the target language.
    - Do not translate internal variable names, placeholders, or piping tokens (for example:
      {{Q1}}, [PIPE:DESTINATION], [[VARNAME]], $VARNAME).
+   - When the English source text contains a pattern of 'Full Name (ABBREVIATION)' for
+     organizations, agencies, or programs (e.g., 'Transportation Security Administration (TSA)',
+     'Customs and Border Protection (CBP)'), you MUST preserve the full expanded name in your
+     translation. You may translate the full name into the target language or keep it in English,
+     but you must NOT reduce it to just the abbreviation. The abbreviation in parentheses must
+     also be preserved as-is.
 
 6. Output format
    - You MUST always return a valid JSON object with the required keys and no extra text.
    - The 'change_reason' field MUST always be written in ENGLISH, even when you are
      translating into another language.
 """
+
+    localization_mode_instruction = ""
+    if is_same_language_localization:
+        _vocab_block = ""
+        if _vocab_for_locale:
+            _lines = "\n".join(
+                f"  {us} -> {local}"
+                for us, local in _vocab_for_locale.items()
+            )
+            _vocab_block = (
+                f"APPROVED VOCABULARY WHITELIST for {locale_code}:\n"
+                f"{_lines}\n"
+                "Only convert vocabulary items listed above. If a US term is NOT in the "
+                "whitelist, leave it unchanged.\n\n"
+            )
+        localization_mode_instruction = (
+            "DIALECT ADAPTATION MODE — STRICT RULES:\n"
+            "The source and target are both English. You are adapting dialect-specific "
+            "spelling and vocabulary ONLY. The majority of rows will require ZERO changes.\n\n"
+            "PERMITTED changes (the ONLY changes you may make):\n"
+            "- Spelling conventions: color/colour, center/centre, "
+            "traveled/travelled, canceled/cancelled, defense/defence, analog/analogue\n"
+            "- Vocabulary substitutions ONLY from the approved whitelist.\n\n"
+            + _vocab_block
+            + "PROHIBITED changes (you MUST NOT do any of the following):\n"
+            "- Do NOT change grammatical structure, person, or phrasing. If the source says "
+            "'Visited a UNESCO World Heritage Site', do NOT add 'I visited...' or any prefix.\n"
+            "- Do NOT insert, remove, or reorder words (no adding 'that', 'which', articles) "
+            "unless the whitelist entry includes them.\n"
+            "- Do NOT change adjectives or qualifiers (e.g., do NOT change 'quiet' to 'quieter').\n"
+            "- Do NOT convert currency symbols, amounts, or formatting. Leave $, EUR, etc. as-is.\n"
+            "- Do NOT add content not in the source (no km equivalents, no explanatory notes).\n"
+            "- Do NOT change number formatting (do NOT change '5 - 10' to '5–10').\n"
+            "- Do NOT add, remove, or change punctuation. Keep all periods, commas, hyphens, "
+            "dashes, and quotation marks exactly as they appear. Do NOT 'fix' punctuation.\n"
+            "- Do NOT rephrase, restructure, or 'improve' the text in any way.\n"
+            "- Do NOT correct errors, typos, or capitalization in the source. If the source "
+            "has 'District Of Columbia', output 'District Of Columbia' exactly.\n"
+            "- Do NOT convert 'state' to 'province' for UK or AU English.\n"
+            "- When a US term is used as an adjective (e.g., 'state park'), use the adjective "
+            "form of the local equivalent ('provincial park'), not the noun ('province park').\n\n"
+            "If no dialect-specific spelling or vocabulary changes are needed, return the "
+            "source text UNCHANGED.\n"
+        )
 
     user_prompt = f"""
 Target language code: {language_code}
@@ -1118,6 +1604,8 @@ Target locale code: {locale_code}
 Global survey context:
 {global_context}
 
+{localization_mode_instruction}
+
 Segment metadata for this element:
 - segment_type: {segment_type_str}
 - block_style (JSON, may be null): {block_style_json}
@@ -1125,6 +1613,12 @@ Segment metadata for this element:
 {context_instruction}
 
 {peer_options_instruction}
+
+{grounding_instruction}
+
+{list_context_instruction}
+
+{brand_name_instruction}
 
 {gender_inclusive_instruction}
 
@@ -1137,7 +1631,7 @@ Existing translation in the target language (may be empty or just a copy of the 
 Translation memory examples (English -> target translation):
 {memory_str}
 
-Interpretation of segment_type and block_style:
+{"" if is_same_language_localization else """Interpretation of segment_type and block_style:
 - If segment_type = "question":
     - Translate as a full, natural question in the target language, using the polite form
       that is standard for surveys in the target locale.
@@ -1182,14 +1676,10 @@ Interpretation of segment_type and block_style:
       proposing changes that only reflect stylistic preferences. Only propose changes to scale
       labels when they fix problems with semantics, ordering, clarity, or obvious
       unnaturalness in the target language.
-
-
+"""}
 Instructions:
-1. If the existing translation is effectively empty or simply repeats the English text, treat this as if there
-   were no translation yet. In this case you MUST propose a high-quality translation whose main human-readable
-   content is clearly in the target language, not in English. It is incorrect to simply copy the English sentence,
-   except for proper names, brand names, and technical tokens.
-2. If the existing translation is non-empty and clearly already in the target language, treat it as the baseline
+{"1. Only adapt dialect-specific spelling and vocabulary. If the source text is already correct for the target locale, return it unchanged. Returning the source text unchanged is the correct and expected behavior for most rows." if is_same_language_localization else "1. If the existing translation is effectively empty or simply repeats the English text, treat this as if there were no translation yet. In this case you MUST propose a high-quality translation whose main human-readable content is clearly in the target language, not in English. It is incorrect to simply copy the English sentence, except for proper names, brand names, and technical tokens."}
+{"2. Do NOT change grammatical structure, person, or phrasing of the source text. Preserve the exact sentence structure, word order, and grammatical person. If the source uses a bare past tense ('Visited...'), you must keep it as a bare past tense. Do NOT add pronouns ('I visited...') or restructure in any way." if is_same_language_localization else """2. If the existing translation is non-empty and clearly already in the target language, treat it as the baseline
    and only propose changes if they improve:
    - semantic accuracy or preservation of qualifiers,
    - measurement safety (clearer distinctions or better ordered scale points),
@@ -1201,27 +1691,25 @@ Instructions:
    - accents and punctuation.
    For scale_label elements in particular, you should NOT propose changes that only add
    stylistic variants (such as explicit gender marking or inclusive forms) when the
-   existing label is already natural and forms part of a clear, symmetric scale.
-3. Always perform a self-QA step on your proposed translation. If your proposed translation, after stripping HTML
-   tags and condensing whitespace, is still essentially identical to the English text, you must reconsider and
-   produce a real translation in the target language.
-4. You MUST NOT change or remove any HTML tags, placeholders, or piping tokens. Only translate the text between them.
-5. Style compliance check: Before returning your JSON, verify that your proposed_translation
+   existing label is already natural and forms part of a clear, symmetric scale."""}
+3. Always perform a self-QA step on your proposed translation.{"" if is_same_language_localization else " If your proposed translation, after stripping HTML tags and condensing whitespace, is still essentially identical to the English text, you must reconsider and produce a real translation in the target language."}
+4. You MUST NOT change or remove any HTML tags, placeholders, or piping tokens. Only {"adapt" if is_same_language_localization else "translate"} the text between them.
+{"5. Do NOT change any punctuation, currency symbols, number formatting, or add any content not present in the source." if is_same_language_localization else """5. Style compliance check: Before returning your JSON, verify that your proposed_translation
    matches the block_style for this segment. If grammatical_person is 'first_person' but your
    translation does not use first-person phrasing, rewrite it. If phrase_form is 'noun_phrase'
-   but your translation is a full clause, rewrite it. This check is mandatory.
+   but your translation is a full clause, rewrite it. This check is mandatory."""}
 6. Return ONLY a valid JSON object with the following keys:
    - "proposed_translation": string
    - "qa_checked_translation": string
    - "needs_change": boolean
    - "change_reason": string (short explanation in English; empty if no change needed)
 
-Very important when rewriting:
+{"" if is_same_language_localization else """Very important when rewriting:
 - You MUST keep all critical qualifiers from the English and any existing translation
   (for example: temporary vs permanent, unpaid vs paid, full-time vs part-time, looking
   for work vs not looking for work, disability, retired, etc.).
 - You MUST preserve all tags, placeholders and piping tokens exactly.
-
+"""}
 Your response:
 - Always perform a quick self-QA step before answering.
 - Return ONLY a JSON object with these keys:
@@ -1349,11 +1837,51 @@ async def translate_scale_batch_async(
         context.language_code, gender_inclusive
     )
 
+    brand_name_instruction = build_brand_name_instruction(context.language_code)
+
     labels_json = json.dumps(english_labels, ensure_ascii=False)
     existing_json = json.dumps(existing_translations, ensure_ascii=False)
 
     domain_fragment = build_domain_prompt_fragment(global_context)
-    system_prompt = f"""You are a professional translator for market-research questionnaires.
+    is_localization = context.is_same_language_localization
+
+    _scale_vocab = DIALECT_VOCABULARY.get(context.locale_code, {})
+    _scale_vocab_lines = ""
+    if _scale_vocab:
+        _scale_vocab_lines = "\n".join(
+            f'   "{us}" -> "{local}"' for us, local in _scale_vocab.items()
+        )
+
+    if is_localization:
+        system_prompt = f"""You are a professional copy editor specializing in regional English dialect
+adaptation for market-research questionnaires.
+Domain context: {domain_fragment}
+You adapt rating-scale label sets from one English dialect to another (e.g., US English
+to British English), changing ONLY dialect-specific spelling and vocabulary.
+
+The ONLY changes you are permitted to make are:
+1. Spelling conventions (e.g., color/colour, center/centre, traveled/travelled).
+2. Vocabulary substitutions ONLY from the approved whitelist:
+{_scale_vocab_lines if _scale_vocab_lines else "   (No vocabulary substitutions — spelling changes only.)"}
+
+If the labels are already correct for the target locale, return them UNCHANGED.
+
+You MUST NOT:
+- Change grammatical structure, person, or phrasing of any label.
+- Convert currency symbols, amounts, or formatting.
+- Add content not in the source (no km equivalents, no explanatory notes).
+- Change number formatting (do NOT change "5 - 10" to "5-10").
+- Add, remove, or change punctuation.
+- Rephrase, restructure, or "improve" text beyond spelling/vocabulary.
+- Correct errors, typos, or capitalization in the source text.
+
+Maintain all labels as a coherent scale. Preserve scale polarity and intensity.
+Preserve all HTML tags, placeholders, and piping tokens exactly.
+Respect translation memory examples when they fit.
+The 'notes' field MUST always be written in ENGLISH.
+Return ONLY a valid JSON object with the required keys and no extra text."""
+    else:
+        system_prompt = f"""You are a professional translator for market-research questionnaires.
 Domain context: {domain_fragment}
 You translate rating-scale label sets from English into a specified target language and locale.
 
@@ -1361,13 +1889,18 @@ Your priorities:
 1. Translate ALL labels as a single coherent scale — the set must be symmetric,
    monotonic, and use consistent vocabulary and grammatical structure throughout.
 2. Use short, natural phrases appropriate for survey scale labels in the target locale.
-   Avoid long sentences or self-referential statements.
+   Avoid long sentences or self-referential statements. Use natural, idiomatic phrasing
+   that a native speaker would use in everyday language — avoid overly literal or
+   institutional translations. Target consumer-survey register, not legal or formal.
 3. Preserve scale polarity and intensity (e.g., if the English goes from very positive
    to very negative, the target language set must do the same).
-4. Preserve all HTML tags, placeholders, and piping tokens exactly.
-5. Respect translation memory examples when they fit.
-6. The 'notes' field MUST always be written in ENGLISH.
-7. Return ONLY a valid JSON object with the required keys and no extra text."""
+4. Translate the EXACT meaning of each English label. Do NOT reinterpret or adapt the
+   concept based on the question stem. If the English label says 'comfortable', translate
+   as 'comfortable/at ease', NOT as 'interested' or 'willing'.
+5. Preserve all HTML tags, placeholders, and piping tokens exactly.
+6. Respect translation memory examples when they fit.
+7. The 'notes' field MUST always be written in ENGLISH.
+8. Return ONLY a valid JSON object with the required keys and no extra text."""
 
     if all_have_real_translation:
         task_instruction = (
@@ -1402,17 +1935,39 @@ Your priorities:
             f'that same word or word family — do NOT use a different synonym.'
         )
 
+    localization_note = ""
+    if is_localization:
+        _scale_vocab_note = ""
+        if _scale_vocab:
+            _sv_lines = ", ".join(f"{us}->{local}" for us, local in _scale_vocab.items())
+            _scale_vocab_note = (
+                f"Approved vocabulary whitelist: {_sv_lines}. "
+                "Only convert terms in this list.\n"
+            )
+        localization_note = (
+            "\nDIALECT ADAPTATION MODE — STRICT RULES:\n"
+            "Source and target are both English. Only adapt dialect-specific spelling "
+            "and vocabulary from the approved whitelist. If labels are already correct "
+            "for the target locale, return them UNCHANGED.\n"
+            + _scale_vocab_note
+            + "Do NOT change grammatical structure, punctuation, currency symbols, "
+            "number formatting, or add any content not in the source.\n"
+            "Do NOT correct errors, typos, or capitalization in the source text.\n"
+        )
+
     user_prompt = f"""Target language code: {context.language_code}
 Target locale code: {context.locale_code}
 
 Global survey context:
 {global_context}
-
+{localization_note}
 Question this scale belongs to (English):
 \"\"\"{question_context}\"\"\"
 {translated_q_section}
 
 Scale label style: phrase_form = {scale_phrase_form}
+
+{brand_name_instruction}
 
 {gender_inclusive_instruction}
 
@@ -2099,6 +2654,122 @@ def validate_translation_structure(english_text: str, translation_text: str) -> 
     return True, ""
 
 
+def strip_question_punctuation_from_options(context: "SurveyFileContext") -> int:
+    """
+    Post-processing safety net: remove question-mark punctuation from rows
+    classified as ANSWER_OPTION or SCALE_LABEL, since these should never
+    be rendered as questions in the survey interface.
+
+    Handles standard '?', fullwidth '？', Arabic '؟', and Spanish '¿...?' patterns.
+    Returns the number of rows modified.
+    """
+    fixed = 0
+    for row in context.rows:
+        if row.segment_type not in (SegmentType.ANSWER_OPTION, SegmentType.SCALE_LABEL):
+            continue
+
+        trl = row.new_translation or row.existing_translation or ""
+        if not trl.strip():
+            continue
+
+        original = trl
+        # Strip trailing question marks (standard, fullwidth, Arabic) with optional
+        # preceding non-breaking space (French typography)
+        trl = re.sub(r'[\u00A0\s]*[?？؟]\s*$', '', trl)
+        # Strip leading inverted question mark (Spanish)
+        trl = re.sub(r'^\s*¿\s*', '', trl)
+
+        if trl != original:
+            row.new_translation = trl
+            row.suggestion_reason = (
+                (row.suggestion_reason or "")
+                + " | Auto-fix: removed question punctuation from answer option."
+            )
+            fixed += 1
+    return fixed
+
+
+def preserve_source_punctuation(context: "SurveyFileContext") -> int:
+    """
+    Dialect-adaptation post-processing: ensure the translation's trailing
+    punctuation matches the source exactly.  Catches cases where the LLM
+    drops a period or adds one that wasn't there.
+
+    Only runs for rows that were newly translated (not batch-skipped).
+    Returns the number of rows corrected.
+    """
+    _PUNCT = set(".!,;?")
+    fixed = 0
+    for row in context.rows:
+        if row.batch_translated:
+            continue
+        src = (row.english_text or "")
+        trl = (row.new_translation or "")
+        if not src.strip() or not trl.strip():
+            continue
+
+        # Strip HTML tags for comparison but apply the fix to the original text
+        src_plain = re.sub(r"<[^>]+>", "", src).rstrip()
+        trl_plain = re.sub(r"<[^>]+>", "", trl).rstrip()
+        if not src_plain or not trl_plain:
+            continue
+
+        src_end = src_plain[-1]
+        trl_end = trl_plain[-1]
+
+        if src_end == trl_end:
+            continue
+
+        original_trl = trl
+
+        # Source ends with punctuation but translation doesn't -> append it
+        if src_end in _PUNCT and trl_end not in _PUNCT:
+            trl = trl.rstrip() + src_end
+
+        # Source does NOT end with punctuation but translation does -> strip it
+        if src_end not in _PUNCT and trl_end in _PUNCT:
+            trl = trl.rstrip().rstrip("".join(_PUNCT))
+
+        if trl != original_trl:
+            row.new_translation = trl
+            fixed += 1
+
+    return fixed
+
+
+def validate_abbreviation_preservation(english_text: str, translation_text: str) -> Tuple[bool, str]:
+    """
+    Check that 'Full Name (ABBREVIATION)' patterns from the English source
+    are not reduced to just the abbreviation in the translation.
+
+    Returns (is_valid, message).
+    """
+    if not english_text or not translation_text:
+        return True, ""
+
+    # Find patterns like "Full Name (ABBREV)" where ABBREV is 2-6 uppercase letters
+    pattern = re.compile(r'([A-Z][A-Za-z\s]+?)\s*\(([A-Z]{2,6})\)')
+    matches = pattern.findall(english_text)
+
+    issues = []
+    for full_name, abbrev in matches:
+        if abbrev not in translation_text and f"({abbrev})" not in translation_text:
+            continue
+
+        # Check if the abbreviation appears in parenthetical form in the translation
+        paren_pattern = re.compile(r'\([^)]*' + re.escape(abbrev) + r'[^)]*\)')
+        has_paren_form = bool(paren_pattern.search(translation_text))
+        if not has_paren_form:
+            issues.append(
+                f"'{full_name} ({abbrev})' may have been shortened "
+                f"to just '{abbrev}' — the full name should be preserved."
+            )
+
+    if issues:
+        return False, " | ".join(issues)
+    return True, ""
+
+
 def attempt_placeholder_repair(english_text: str, translation: str) -> str:
     """
     If the translation is missing placeholder tokens from the English source,
@@ -2335,6 +3006,10 @@ async def process_row_async(
 
     # Acquire slot in the semaphore (e.g., max 20 active requests)
     async with semaphore:
+        # Guard against pandas NaN (float NaN is truthy, so `or` won't catch it)
+        if isinstance(row.english_text, float) and pd.isna(row.english_text):
+            row.new_translation = row.english_text
+            return row
         eng_text = (row.english_text or "").strip()
         if not eng_text:
             row.new_translation = row.existing_translation
@@ -2387,8 +3062,24 @@ async def process_row_async(
             if context.blocks and row.block_id is not None:
                 block = context.blocks[row.block_id]
                 # Get the question text(s) for this block
-                q_texts = [context.rows[i].english_text for i in block.question_indices if context.rows[i].english_text]
+                q_texts = [context.rows[i].english_text for i in block.question_indices if 0 <= i < len(context.rows) and context.rows[i].english_text]
                 parent_context_str = " ".join(q_texts)
+
+        # Compute block-level answer option stats for list-context heuristic
+        ao_count = 0
+        ao_avg_len = 0.0
+        if row.segment_type == SegmentType.ANSWER_OPTION and context.blocks and row.block_id is not None:
+            try:
+                blk = context.blocks[row.block_id]
+                ao_texts = [
+                    (context.rows[i].english_text or "").strip()
+                    for i in blk.answer_option_indices
+                    if i is not None and context.rows[i].english_text
+                ]
+                ao_count = len(ao_texts)
+                ao_avg_len = sum(len(t) for t in ao_texts) / ao_count if ao_count else 0.0
+            except Exception:
+                pass
 
         # Call the model
         result = await call_translation_model_async(
@@ -2399,10 +3090,13 @@ async def process_row_async(
             translation_memory=context.translation_memory,
             existing_translation=row.existing_translation if row.had_real_translation else None,
             segment_type=row.segment_type,
-            block_style=context.block_styles.get(row.block_id) if row.block_id is not None else None,
+            block_style=(context.block_styles.get(row.block_id) if context.block_styles and row.block_id is not None else None),
             peer_english_options=peer_english_options,
             parent_context=parent_context_str,
             gender_inclusive=gender_inclusive,
+            answer_option_count=ao_count,
+            answer_option_avg_len=ao_avg_len,
+            is_same_language_localization=context.is_same_language_localization,
         )
 
         # --- Process Result (Same logic as before, just adapted for async return) ---
@@ -2421,18 +3115,58 @@ async def process_row_async(
             row.suggestion_reason = ((row.suggestion_reason + " | ") if row.suggestion_reason else "") + \
                                     f"Structure validation warning: {msg}"
 
+        # Abbreviation preservation check
+        abbrev_ok, abbrev_msg = validate_abbreviation_preservation(eng_text, proposed)
+        if not abbrev_ok:
+            row.suggestion_reason = ((row.suggestion_reason + " | ") if row.suggestion_reason else "") + \
+                                    f"Abbreviation warning: {abbrev_msg}"
+
         # Copy check must run regardless of structure validation outcome.
-        if (not result.get("error")) and (not row.had_real_translation) and should_run_copy_check(eng_text, variable_name=row.variable_name):
+        # Skip entirely for same-language localization (e.g. en → en-GB) where
+        # identical output is expected and correct for most rows.
+        if (not context.is_same_language_localization
+                and not result.get("error")
+                and not row.had_real_translation
+                and should_run_copy_check(eng_text, variable_name=row.variable_name)):
             if is_effective_copy_of_english(eng_text, proposed):
-                base = row.existing_translation or eng_text
-                row.new_translation = base
-                row.suggested_translation = base
-                row.suggestion_reason = (
-                    (row.suggestion_reason or "")
-                    + "Model output is effectively identical to the English source; "
-                      "translation likely failed. Please review/translate this row manually."
+                # Retry once with an explicit instruction to not return English
+                retry_result = await call_translation_model_async(
+                    english_text=eng_text,
+                    language_code=context.language_code,
+                    locale_code=context.locale_code,
+                    global_context=(
+                        global_context + "\n\nCRITICAL RETRY: Your previous attempt returned "
+                        "the English text unchanged. You MUST translate this into the target "
+                        "language. Do NOT return the English text."
+                    ),
+                    translation_memory=context.translation_memory,
+                    existing_translation=None,
+                    segment_type=row.segment_type,
+                    block_style=(context.block_styles.get(row.block_id) if context.block_styles and row.block_id is not None else None),
+                    parent_context=parent_context_str,
+                    gender_inclusive=gender_inclusive,
+                    peer_english_options=peer_english_options,
+                    answer_option_count=ao_count,
+                    answer_option_avg_len=ao_avg_len,
+                    is_same_language_localization=context.is_same_language_localization,
                 )
-                return row
+                retry_proposed = (
+                    retry_result.get("qa_checked_translation")
+                    or retry_result.get("proposed_translation")
+                    or ""
+                )
+                if retry_proposed and not is_effective_copy_of_english(eng_text, retry_proposed):
+                    proposed = retry_proposed
+                else:
+                    base = row.existing_translation or eng_text
+                    row.new_translation = base
+                    row.suggested_translation = base
+                    row.suggestion_reason = (
+                        (row.suggestion_reason or "")
+                        + "Model output is effectively identical to the English source after retry; "
+                          "translation likely failed. Please review/translate this row manually."
+                    )
+                    return row
 
         # If structure validation failed and copy check didn't fire, fall back now.
         if not is_ok:
@@ -2451,10 +3185,16 @@ async def process_row_async(
             existing = (row.existing_translation or "").strip()
             if existing and existing.lower() == eng_text.strip().lower():
                 snippet = existing[:80]
-                row.suggestion_reason = (
-                    (row.suggestion_reason or "")
-                    + f"Copy check: existing translation was identical to English source ('{snippet}'). Retranslated."
-                )
+                if context.is_same_language_localization:
+                    row.suggestion_reason = (
+                        (row.suggestion_reason or "")
+                        + f"Localized from source English to {context.locale_code} conventions."
+                    )
+                else:
+                    row.suggestion_reason = (
+                        (row.suggestion_reason or "")
+                        + f"Copy check: existing translation was identical to English source ('{snippet}'). Retranslated."
+                    )
         else:
             # QA Existing
             row.new_translation = row.existing_translation
@@ -2494,6 +3234,8 @@ async def restyle_mismatched_rows(
     task_meta: list[tuple] = []  # parallel list: (row, expected_pattern) per task
 
     for block in context.blocks:
+        if not context.block_styles:
+            continue
         style = context.block_styles.get(block.block_id)
         if not style:
             continue
@@ -2552,6 +3294,7 @@ async def restyle_mismatched_rows(
                             block_style=_style,
                             parent_context=_parent_ctx,
                             gender_inclusive=gender_inclusive,
+                            is_same_language_localization=context.is_same_language_localization,
                         )
 
                 tasks.append(_restyle_one())
@@ -2784,6 +3527,7 @@ def write_output_file(
       4: suggestion_reason
     """
     df_out = original_df.copy()
+    df_out = df_out.reset_index(drop=True)
 
     # Ensure at least 3 columns
     if df_out.shape[1] < 3:
@@ -2832,32 +3576,58 @@ def write_output_file(
     suffix = "_translated"
     if has_suggestions:
         suffix += "_WITH_SUGGESTIONS"
-    output_filename = base_name + suffix + ".xlsx"
+    output_filename = base_name + suffix + ".xls"
 
-    # Sanitize all string cells to strip control characters openpyxl rejects
-    from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
+    # Strip control characters that can cause encoding errors in xlwt
+    _CONTROL_CHAR_RE = re.compile(r'[\x00-\x08\x0b\x0c\x0e-\x1f]')
     for col in df_out.columns:
         if df_out[col].dtype == object:
             df_out[col] = df_out[col].apply(
-                lambda v: ILLEGAL_CHARACTERS_RE.sub("", v) if isinstance(v, str) else v
+                lambda v: _CONTROL_CHAR_RE.sub("", v) if isinstance(v, str) else v
             )
 
-    # Serialize to Excel in memory, with an extra sheet for block-level style logs (Layer 4)
+    # Serialize to XLS using xlwt directly (Pandas 2.x dropped xlwt engine support)
+    import xlwt
+
+    def _write_df_to_xlwt_sheet(workbook, df, sheet_name):
+        """Write a DataFrame to an xlwt sheet with headers."""
+        import numpy as np
+        ws = workbook.add_sheet(sheet_name)
+        for col_idx, col_name in enumerate(df.columns):
+            ws.write(0, col_idx, str(col_name))
+        for row_idx in range(len(df)):
+            for col_idx in range(len(df.columns)):
+                val = df.iat[row_idx, col_idx]
+                if pd.isna(val):
+                    ws.write(row_idx + 1, col_idx, "")
+                elif isinstance(val, str):
+                    ws.write(row_idx + 1, col_idx, val[:32767])
+                elif isinstance(val, (np.integer, np.int64)):
+                    ws.write(row_idx + 1, col_idx, int(val))
+                elif isinstance(val, (np.floating, np.float64)):
+                    ws.write(row_idx + 1, col_idx, float(val))
+                elif isinstance(val, (np.bool_,)):
+                    ws.write(row_idx + 1, col_idx, bool(val))
+                else:
+                    ws.write(row_idx + 1, col_idx, str(val))
+
+    wb = xlwt.Workbook(encoding="utf-8")
+
+    # Main translations sheet
+    _write_df_to_xlwt_sheet(wb, df_out, "translations")
+
+    # Optional style log sheet
+    style_log_df = build_block_style_log_df(context)
+    if style_log_df is not None and not style_log_df.empty:
+        for col in style_log_df.columns:
+            if style_log_df[col].dtype == object:
+                style_log_df[col] = style_log_df[col].apply(
+                    lambda v: _CONTROL_CHAR_RE.sub("", v) if isinstance(v, str) else v
+                )
+        _write_df_to_xlwt_sheet(wb, style_log_df, "__style_log")
+
     buffer = io.BytesIO()
-    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-        # Main translations sheet
-        df_out.to_excel(writer, index=False, sheet_name="translations")
-
-        # Optional style log sheet
-        style_log_df = build_block_style_log_df(context)
-        if style_log_df is not None and not style_log_df.empty:
-            for col in style_log_df.columns:
-                if style_log_df[col].dtype == object:
-                    style_log_df[col] = style_log_df[col].apply(
-                        lambda v: ILLEGAL_CHARACTERS_RE.sub("", v) if isinstance(v, str) else v
-                    )
-            style_log_df.to_excel(writer, index=False, sheet_name="__style_log")
-
+    wb.save(buffer)
     buffer.seek(0)
     excel_bytes = buffer.getvalue()
 
@@ -3051,6 +3821,9 @@ to:
             build_blocks(context)
             promote_scale_labels(context)
 
+            if context.is_same_language_localization:
+                dialect_skipped = skip_dialect_excluded_rows(context)
+
             st.subheader(f"Processing: {file.name}")
             progress_bar = st.progress(0.0)
             status_text = st.empty()
@@ -3065,8 +3838,12 @@ to:
 
             async def run_file_processing():
                 # Async style inference (Layer 3)
-                status_text.text("Inferring block styles...")
-                await infer_block_styles_async(context, global_context, semaphore)
+                # Skip for same-language localization — style-driven restructuring
+                # (first-person prefixes, phrase-form enforcement) must not run when
+                # the task is dialect adaptation, not full translation.
+                if not context.is_same_language_localization:
+                    status_text.text("Inferring block styles...")
+                    await infer_block_styles_async(context, global_context, semaphore)
 
                 # Batch-translate scale labels (one LLM call per block)
                 if context.blocks:
@@ -3102,8 +3879,9 @@ to:
                                                 translation_memory=context.translation_memory,
                                                 existing_translation=qrow.existing_translation if qrow.had_real_translation else None,
                                                 segment_type=qrow.segment_type,
-                                                block_style=context.block_styles.get(qrow.block_id) if qrow.block_id is not None else None,
+                                                block_style=(context.block_styles.get(qrow.block_id) if context.block_styles and qrow.block_id is not None else None),
                                                 gender_inclusive=gender_inclusive,
+                                                is_same_language_localization=context.is_same_language_localization,
                                             )
                                         )
                         if q_tasks:
@@ -3195,24 +3973,41 @@ to:
                             hide_index=True
                         )
 
-                # Post-translation style re-check
-                status_text.text("Running style re-check...")
-                restyle_count = await restyle_mismatched_rows(
-                    context, global_context, semaphore,
-                    gender_inclusive=gender_inclusive,
-                    provide_suggestions=provide_suggestions,
-                )
-                if restyle_count:
-                    status_text.text(f"Style re-check: {restyle_count} rows re-translated for style alignment.")
+                # Post-translation style re-check (skip for dialect adaptation)
+                if not context.is_same_language_localization:
+                    status_text.text("Running style re-check...")
+                    restyle_count = await restyle_mismatched_rows(
+                        context, global_context, semaphore,
+                        gender_inclusive=gender_inclusive,
+                        provide_suggestions=provide_suggestions,
+                    )
+                    if restyle_count:
+                        status_text.text(f"Style re-check: {restyle_count} rows re-translated for style alignment.")
 
             # Execute the async loop
             loop.run_until_complete(run_file_processing())
+
+            # Post-processing: strip question punctuation from answer options
+            qmark_fixes = strip_question_punctuation_from_options(context)
+            if qmark_fixes:
+                status_text.text(f"Post-processing: removed question punctuation from {qmark_fixes} answer option(s).")
+
+            # Dialect adaptation post-processing
+            if context.is_same_language_localization:
+                punct_fixes = preserve_source_punctuation(context)
+                if punct_fixes:
+                    status_text.text(f"Post-processing: restored punctuation on {punct_fixes} row(s).")
+
+                spelling_fixes = apply_dialect_spelling_corrections(context)
+                if spelling_fixes:
+                    status_text.text(f"Post-processing: applied {spelling_fixes} deterministic spelling correction(s).")
 
             # Post-processing
             status_text.text("Running Consistency Pass & Style Checks...")
 
             # Only do style warnings / suggestion columns when enabled
-            if provide_suggestions:
+            # (skip entirely for dialect adaptation — no style enforcement)
+            if provide_suggestions and not context.is_same_language_localization:
                 block_style_validation(context)
 
             # Consistency pass should run regardless; when suggestions are OFF,
@@ -3249,6 +4044,7 @@ to:
                 "num_new_translations": n_new,
                 "num_suggestions": n_sugg,
                 "num_error_rows": n_err,
+                "is_same_language_localization": context.is_same_language_localization,
             }
 
             # Immediately persist to session state so the download survives
@@ -3268,7 +4064,7 @@ to:
                     label=f"Download: {res['out_filename']}",
                     data=res["excel_bytes"],
                     file_name=res["out_filename"],
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    mime="application/vnd.ms-excel",
                     key=f"download_inline_{res['file_name']}",
                 )
 
@@ -3288,9 +4084,13 @@ to:
     def _render_downloads():
         results = st.session_state.get("processed_results", [])
         for res in results:
+            new_label = (
+                "Rows localized" if res.get("is_same_language_localization")
+                else "New translations (former English placeholders)"
+            )
             st.success(
                 f"Finished processing `{res['file_name']}`. "
-                f"New translations (former English placeholders): {res['num_new_translations']} | "
+                f"{new_label}: {res['num_new_translations']} | "
                 f"Rows with suggestions/warnings: {res['num_suggestions']} | "
                 f"Rows with LLM errors: {res['num_error_rows']}"
             )
@@ -3299,7 +4099,7 @@ to:
                 label=f"Download processed file: {res['out_filename']}",
                 data=res["excel_bytes"],
                 file_name=res["out_filename"],
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                mime="application/vnd.ms-excel",
                 key=f"download_{res['file_name']}",
             )
 

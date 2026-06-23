@@ -18,16 +18,20 @@ This tool translates market-research questionnaires into many languages and regi
 
 - **GPT-powered translation & QA** — Translates untranslated rows and optionally reviews existing human translations, surfacing suggestions and warnings.
 - **Multi-language & locale support** — Spanish (MX, AR, CO, CL, PE, ES), French (FR, CA), Portuguese (BR, PT), German (DE, AT, CH), Italian (IT, CH), Dutch (NL, BE), Japanese, Korean, Chinese (Simplified/Traditional/HK), and English (US, GB, CA, AU), with BCP-47 locale codes passed to the model for region-appropriate phrasing. Languages outside the built-in locale list fall back to a single generic option.
+- **English-to-English regional localization** — When the target locale is a non-US English variant (en-GB, en-CA, en-AU), the tool operates in a dedicated localization mode. Instead of full translation, it adapts spelling conventions (color/colour), vocabulary (elevator/lift), idioms, and date/currency formatting to match the target dialect, leaving everything else unchanged. Copy-check and retry logic are bypassed since identical source/target text is expected for most rows.
 - **Configurable domain context** — Editable global context field lets you tailor every prompt to the survey's domain (e.g. healthcare, travel, finance) instead of relying on a hard-coded description.
 - **Structural classification** — Automatically categorises each row as a question, instruction, answer option, or scale label using text heuristics and Forsta variable-name patterns, then groups them into question blocks for context-aware translation. A post-classification promotion step aligns short label-like answer options to scale labels when Likert-style blocks are detected.
 - **Block-level style inference & enforcement** — Infers grammatical person, phrase form, and tone for each block via async LLM calls. Translations are held to hard style constraints, and a post-translation re-check pass automatically re-translates any answer options that still deviate from the inferred style. A `noun_phrase_like` category prevents false-positive restyle warnings on longer (60–100+ char) answer options.
 - **Scale batch translation** — Scale-label blocks (2+ scale labels) are translated in a single JSON call per block after their parent question is pre-translated, ensuring coherent, parallel phrasing across the entire scale set.
 - **Peer-option parallelism** — For small, label-like answer-option sets (2–8 items), the full ordered peer list is sent to the model so translations stay grammatically and stylistically parallel.
+- **Semantic grounding for answer options** — Answer option and scale label translations are explicitly grounded in the English source text. Parent question context is provided for grammatical fit but the model is instructed not to reinterpret option meanings based on the question stem, preventing semantic drift (e.g. "comfortable" options being mistranslated as "interested/willing").
+- **List-context article dropping** — For dropdown-style blocks (10+ short answer options, e.g. country lists), languages with definite articles (French, Portuguese, Spanish, Italian, German, Dutch) receive an instruction to omit articles before names for consistency within the list.
+- **CJK brand name handling** — For Japanese, Korean, and Chinese, technology brand names are kept in their original English form with the local-language reading added in parentheses (e.g. `Copilot(コパイロット)`) rather than being fully transliterated.
 - **Gender-inclusive forms toggle** — Per-file checkbox (defaults to ON for French) that instructs the model to add parenthetical gender-inclusive forms on adjective-based labels. The instruction is **language-aware and scoped**: it only targets adjectives that describe the survey respondent (not objects, probabilities, or quality ratings), with per-language examples and markers for French, Spanish, Portuguese, Italian, and German. Languages without grammatical gender receive no instruction.
 - **Survey-level consistency pass** — Uses fuzzy matching + an LLM call to identify repeated English phrases translated differently, then suggests (or auto-applies) a canonical translation. Freshly translated rows are auto-corrected in the Translation column; existing human translations are never overwritten ("locked"). Can be toggled on or off.
 - **Structure validation & auto-repair** — Guards against missing/altered HTML tags, placeholders (`[piped text]`, `{TOKEN}`, `[[VARNAME]]`), and numeric ranges. When a placeholder is dropped during translation, the tool attempts automatic positional repair before falling back to a warning.
 - **Numeric/range guards** — Pure numeric and range-code options (e.g. `1970–1989`, `$100`) are passed through unchanged, preventing unwanted prose rewrites.
-- **Translation failure detection** — Flags rows where the model's output is effectively a copy of the English source, prompting manual review. Short proper nouns, named entities, and title-case Forsta option rows are exempted to avoid false positives.
+- **Translation failure detection with retry** — Flags rows where the model's output is effectively a copy of the English source. When detected on a fresh (untranslated) row, the tool automatically retries once with an explicit instruction to produce a target-language translation before falling back to a manual-review flag. Short proper nouns, named entities, and title-case Forsta option rows are exempted to avoid false positives.
 - **Translation memory** — Reuses translations already present in the file for identical English strings, ranked by Jaccard word-similarity to the current row for maximum relevance (up to 5 examples injected into prompts).
 - **Label capitalisation adjustment** — Short, label-like translations are automatically capitalised to match survey-label conventions in the target language (skipped for Japanese and Chinese).
 - **Suggestions toggle** — Optionally suppress QA suggestions for existing translations; the consistency pass still harmonises newly generated translations.
@@ -53,7 +57,7 @@ The tool expects Forsta/Decipher 3-column translation exports (`.xls`, `.xlsx`, 
 ### Installation
 
 ```bash
-pip install streamlit pandas openai python-dotenv openpyxl xlrd
+pip install streamlit pandas openai python-dotenv openpyxl xlrd xlwt
 ```
 
 ### Configuration
@@ -83,7 +87,7 @@ Each processed file is downloaded as an Excel workbook with:
 - **translations** sheet — the original 3 columns plus (when suggestions are enabled) `suggested_translation` and `suggestion_reason` columns.
 - **__style_log** sheet — block-level style analysis details for auditing (block ID, English question text, row counts, inferred style fields, and notes).
 
-Output filenames follow the pattern `<original_name>_translated.xlsx`, with `_WITH_SUGGESTIONS` appended when suggestions or warnings are present. Illegal characters for Excel cells are automatically sanitised before writing.
+Output filenames follow the pattern `<original_name>_translated.xls`, with `_WITH_SUGGESTIONS` appended when suggestions or warnings are present. Control characters are automatically stripped before writing.
 
 ## Project Structure
 
@@ -102,7 +106,7 @@ Feedback/                      # Reviewer feedback files (not committed)
 4. **Scale-label promotion** — In blocks with 2+ scale labels, promote short label-like answer options to `scale_label` for Likert-scale alignment.
 5. **Style inference (Layer 3)** — Async LLM calls infer grammatical person, phrase form, and tone for each block's answer options and scale labels (returns a `BlockStyle` per block).
 6. **Scale batch translation** — Pre-translate question rows in scale-heavy blocks, then translate each block's scale labels as a single JSON batch call for coherent sets.
-7. **Row-level translation/QA (Layer 4)** — Async GPT calls with concurrency control (semaphore of 15); translate new rows, QA existing ones, validate structure (with auto-repair for dropped placeholders), enforce style constraints, and detect translation failures. Rows already batch-translated in step 6 are skipped.
+7. **Row-level translation/QA (Layer 4)** — Async GPT calls with concurrency control (semaphore of 15); translate new rows, QA existing ones, validate structure (with auto-repair for dropped placeholders), enforce style constraints, and detect translation failures (with automatic retry). Prompts enforce consumer-survey register, idiomatic phrasing, semantic grounding for answer options, and conditional list-context/brand-name instructions. Rows already batch-translated in step 6 are skipped.
 8. **Post-translation style re-check (Layer 4.5)** — Re-translate any answer options whose detected style pattern doesn't match the inferred block style; flag unresolvable mismatches for manual review.
 9. **Block-level style validation (Layer 5)** — Flag remaining style mismatches within answer-option sets and scale-label groups (runs only when suggestions are enabled).
 10. **Survey-level consistency pass** — Fuzzy-match repeated English phrases; auto-apply canonical translations to freshly translated rows, or surface as suggestions for existing human translations (when consistency pass is enabled).
