@@ -5,6 +5,7 @@ import re
 import time
 import asyncio
 import string
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -60,6 +61,11 @@ DEFAULT_GLOBAL_CONTEXT = (
 
 TRANSLATION_MODEL_NAME = os.getenv("TRANSLATION_MODEL", "gpt-5-mini")
 CONSISTENCY_MODEL_NAME = os.getenv("CONSISTENCY_MODEL", "gpt-5-mini")
+
+# Token cap passed to every create() call.  Prevents finish_reason='length'
+# silent truncations.  GPT-5/o-series uses max_completion_tokens; older models
+# use max_tokens.  Adjust the param name if the endpoint changes.
+MAX_COMPLETION_TOKENS = int(os.getenv("MAX_COMPLETION_TOKENS", "4096"))
 
 # Simple language mapping (expand as needed)
 LANGUAGE_NAME_TO_CODE = {
@@ -1727,12 +1733,13 @@ Your response:
             response = await client.chat.completions.create(
                 model=model_name,
                 response_format={"type": "json_object"},
+                max_completion_tokens=MAX_COMPLETION_TOKENS,
                 messages=[
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt},
                 ]
             )
-            result = json.loads(response.choices[0].message.content)
+            result = _safe_json(response)
 
             return {
                 "proposed_translation": (result.get("proposed_translation") or "").strip(),
@@ -2005,7 +2012,7 @@ one for each English label, in the same order."""
                         {"role": "user", "content": user_prompt},
                     ],
                 )
-                data = json.loads(response.choices[0].message.content)
+                data = _safe_json(response)
                 translations = data.get("translations", [])
 
                 if not isinstance(translations, list) or len(translations) != len(scale_indices):
@@ -2208,8 +2215,7 @@ def infer_style_for_block(
                     {"role": "user", "content": user_prompt},
                 ],
             )
-            content = response.choices[0].message.content
-            data = json.loads(content)
+            data = _safe_json(response)
 
             options_style = data.get("options_style") or {}
             scale_style = data.get("scale_label_style") or {}
@@ -2400,8 +2406,7 @@ async def infer_style_for_block_async(
                         {"role": "user", "content": user_prompt},
                     ],
                 )
-                content = response.choices[0].message.content
-                data = json.loads(content)
+                data = _safe_json(response)
 
                 options_style = data.get("options_style") or {}
                 scale_style = data.get("scale_label_style") or {}
@@ -2566,8 +2571,7 @@ Here is the JSON data for "groups":
                     {"role": "user", "content": user_prompt},
                 ],
             )
-            content = response.choices[0].message.content
-            data = json.loads(content)
+            data = _safe_json(response)
             issues = data.get("issues", [])
             if not isinstance(issues, list):
                 raise ValueError("`issues` must be a list in consistency model response.")
@@ -2584,7 +2588,58 @@ Here is the JSON data for "groups":
                 time.sleep(2 ** attempt)
                 continue
             else:
-                raise RuntimeError(f"Consistency model call failed: {last_exception}")
+                break
+
+    # Non-retryable failure or retries exhausted: degrade to no-op rather than
+    # killing the run. The consistency pass is best-effort; a hard failure here
+    # must never prevent the output file from being written and persisted.
+    return []
+
+
+# ==========================
+# Safe JSON Parsing
+# ==========================
+
+class _RetryableModelError(Exception):
+    """Raised by _safe_json when the model response is null, truncated, or
+    malformed JSON.  Because it inherits from Exception, every existing
+    ``except Exception`` retry loop in the codebase will catch it and retry
+    without any additional changes."""
+
+
+def _safe_json(response) -> dict:
+    """Null-check, code-fence strip, and finish_reason guard around model JSON.
+
+    Raises _RetryableModelError for every recoverable failure so the caller's
+    existing retry loop re-tries transparently.  Never swallows errors silently.
+    """
+    try:
+        choice = response.choices[0]
+    except (AttributeError, IndexError, TypeError) as exc:
+        raise _RetryableModelError(f"No choices in model response: {exc}") from exc
+
+    finish_reason = getattr(choice, "finish_reason", None)
+    content = getattr(getattr(choice, "message", None), "content", None)
+
+    if content is None:
+        raise _RetryableModelError(
+            f"Null content from model (finish_reason={finish_reason!r})"
+        )
+    if finish_reason == "length":
+        raise _RetryableModelError(
+            "Response truncated by token limit (finish_reason='length'); will retry."
+        )
+
+    text = content.strip()
+    if text.startswith("```"):
+        # Strip optional language tag (```json) and closing fence
+        text = re.sub(r"^```[A-Za-z]*\s*", "", text)
+        text = re.sub(r"\s*```$", "", text).strip()
+
+    try:
+        return json.loads(text)
+    except (json.JSONDecodeError, ValueError) as exc:
+        raise _RetryableModelError(f"Malformed JSON from model: {exc}") from exc
 
 
 # ==========================
@@ -2615,6 +2670,22 @@ def extract_placeholder_tokens(text: str) -> List[str]:
     return sorted(set(tokens))
 
 
+# HTML-tag fidelity: match opening and closing tags (e.g. <b>, </b>, <br>, <a href="...">).
+# Whitespace inside tags is normalized so minor formatting differences don't count as distinct.
+_TAG_RE = re.compile(r'</?[A-Za-z][^>]*>')
+
+
+def extract_html_tags(text: str) -> List[str]:
+    """Return a sorted list of HTML tags found in *text* (whitespace-normalized).
+
+    Tags are not deduplicated so that Counter arithmetic gives correct multiset
+    comparisons (e.g. two <b> tags in the source must have two in the translation).
+    """
+    if not text:
+        return []
+    return sorted(re.sub(r'\s+', ' ', t).strip() for t in _TAG_RE.findall(text))
+
+
 def validate_translation_structure(english_text: str, translation_text: str) -> Tuple[bool, str]:
     """
     Validate that numeric/currency tokens and placeholder/piping tokens from the English
@@ -2628,26 +2699,63 @@ def validate_translation_structure(english_text: str, translation_text: str) -> 
     if not english_text.strip() or not translation_text.strip():
         return True, ""
 
-    # Numeric tokens: compare digit sequences only
-    eng_nums = extract_numeric_tokens(english_text)
-    digits_in_trl = re.sub(r"\D", "", translation_text)
+    # Numeric tokens: compare as a MULTISET of separator-normalized digit groups
+    # so "100" no longer "passes" against "1000", and dropped duplicates are caught.
+    def _digit_groups(text: str) -> List[str]:
+        groups: List[str] = []
+        for tok in extract_numeric_tokens(text):
+            d = re.sub(r"\D", "", tok)
+            if d:
+                groups.append(d)
+        return groups
 
-    missing_numeric: List[str] = []
-    for tok in eng_nums:
-        digits = re.sub(r"\D", "", tok)
-        if digits and digits not in digits_in_trl:
-            missing_numeric.append(tok)
+    eng_groups = _digit_groups(english_text)
+    trl_groups = _digit_groups(translation_text)
+    # Counter subtraction: elements in eng_groups not (fully) covered by trl_groups
+    missing_numeric = list((Counter(eng_groups) - Counter(trl_groups)).elements())
+
+    # Range order: catch reversed ranges such as "18-34" → "34-18".
+    # Only hyphen/en-dash/em-dash separators are considered; decimal points inside
+    # numbers are stripped before comparison, so "1.5-2.5" → (15, 25) pair.
+    # Known limitation: collapsing decimals means 1.5 and 15 look identical;
+    # this is an acceptable trade-off for survey text where integer ranges dominate.
+    _RANGE_RE = re.compile(r"(\d[\d.,]*)\s*[-\u2013\u2014]\s*(\d[\d.,]*)")
+
+    def _range_pairs(text: str) -> List[tuple]:
+        pairs: List[tuple] = []
+        for a, b in _RANGE_RE.findall(text):
+            ai = re.sub(r"\D", "", a)
+            bi = re.sub(r"\D", "", b)
+            if ai and bi:
+                pairs.append((int(ai), int(bi)))
+        return pairs
+
+    trl_pairset = set(_range_pairs(translation_text))
+    reversed_ranges = [
+        f"{a}-{b}"
+        for (a, b) in _range_pairs(english_text)
+        if (a, b) not in trl_pairset and (b, a) in trl_pairset
+    ]
 
     # Placeholder/tokens
     eng_placeholders = extract_placeholder_tokens(english_text)
     missing_placeholders = [tok for tok in eng_placeholders if tok not in translation_text]
 
-    if missing_numeric or missing_placeholders:
+    # HTML-tag fidelity (advertised in the app description; language-agnostic advisory flag)
+    eng_tags = extract_html_tags(english_text)
+    trl_tags = extract_html_tags(translation_text)
+    missing_tags = list((Counter(eng_tags) - Counter(trl_tags)).elements())
+
+    if missing_numeric or reversed_ranges or missing_placeholders or missing_tags:
         parts = []
         if missing_numeric:
             parts.append("numerics " + ", ".join(missing_numeric))
+        if reversed_ranges:
+            parts.append("reversed ranges " + ", ".join(reversed_ranges))
         if missing_placeholders:
             parts.append("placeholders " + ", ".join(missing_placeholders))
+        if missing_tags:
+            parts.append("HTML tags " + ", ".join(missing_tags))
         msg = "Missing or altered " + " and ".join(parts) + " compared to the English source."
         return False, msg
 
@@ -3168,16 +3276,34 @@ async def process_row_async(
                     )
                     return row
 
-        # If structure validation failed and copy check didn't fire, fall back now.
+        # If structure validation failed and copy check didn't fire, still SHIP a
+        # translation (flagged) for a new row — never silently fall back to English.
         if not is_ok:
-            base = row.existing_translation or eng_text
-            row.new_translation = base
-            row.suggested_translation = proposed
+            if not row.had_real_translation:
+                if proposed.strip():
+                    row.new_translation = adjust_capitalization_for_label(eng_text, proposed, context.language_code)
+                    row.suggestion_reason = (
+                        ((row.suggestion_reason + " | ") if row.suggestion_reason else "")
+                        + "STRUCTURE FLAG: shipped translation despite failed structure validation; needs review."
+                    )
+                else:
+                    row.new_translation = eng_text
+                    row.suggestion_reason = (
+                        ((row.suggestion_reason + " | ") if row.suggestion_reason else "")
+                        + "STRUCTURE FLAG: model returned empty output; English retained; needs review."
+                    )
+                row.was_newly_translated = True
+                row.suggested_translation = proposed
+            else:
+                # Existing translation: never overwrite it; surface the proposed fix.
+                row.new_translation = row.existing_translation
+                row.suggested_translation = proposed
             return row
 
         if result.get("error"):
             row.suggestion_reason = f"LLM Error: {result.get('change_reason')}"
-            row.new_translation = row.existing_translation or "[ERROR]"
+            # For new rows, ship a visible sentinel rather than blank or plain English.
+            row.new_translation = row.existing_translation or "[TRANSLATION FAILED — REVIEW]"
         elif not row.had_real_translation:
             # New Translation
             row.new_translation = adjust_capitalization_for_label(eng_text, proposed, context.language_code)
@@ -3811,264 +3937,275 @@ to:
         st.session_state["processed_results"] = []
 
         for cfg in file_configs:
-            file = cfg["file"]
-            file.seek(0)
-            context, original_df = load_forsta_export(file, cfg["language_code"], cfg["locale_code"])
-            gender_inclusive = cfg.get("gender_inclusive", False)
+            try:
+                file = cfg["file"]
+                file.seek(0)
+                context, original_df = load_forsta_export(file, cfg["language_code"], cfg["locale_code"])
+                gender_inclusive = cfg.get("gender_inclusive", False)
 
-            # Pre-processing layers (sync)
-            classify_segments(context)
-            build_blocks(context)
-            promote_scale_labels(context)
+                # Pre-processing layers (sync)
+                classify_segments(context)
+                build_blocks(context)
+                promote_scale_labels(context)
 
-            if context.is_same_language_localization:
-                dialect_skipped = skip_dialect_excluded_rows(context)
+                if context.is_same_language_localization:
+                    dialect_skipped = skip_dialect_excluded_rows(context)
 
-            st.subheader(f"Processing: {file.name}")
-            progress_bar = st.progress(0.0)
-            status_text = st.empty()
+                st.subheader(f"Processing: {file.name}")
+                progress_bar = st.progress(0.0)
+                status_text = st.empty()
 
-            # LIVE PREVIEW SETUP
-            st.caption("Live Activity Log (Showing last 5 processed rows)")
-            live_table_placeholder = st.empty()
-            preview_data = []
+                # LIVE PREVIEW SETUP
+                st.caption("Live Activity Log (Showing last 5 processed rows)")
+                live_table_placeholder = st.empty()
+                preview_data = []
 
-            # SEMAPHORE: Control parallelism (e.g., 15 concurrent requests)
-            semaphore = asyncio.Semaphore(15)
+                # SEMAPHORE: Control parallelism (e.g., 15 concurrent requests)
+                semaphore = asyncio.Semaphore(15)
 
-            async def run_file_processing():
-                # Async style inference (Layer 3)
-                # Skip for same-language localization — style-driven restructuring
-                # (first-person prefixes, phrase-form enforcement) must not run when
-                # the task is dialect adaptation, not full translation.
-                if not context.is_same_language_localization:
-                    status_text.text("Inferring block styles...")
-                    await infer_block_styles_async(context, global_context, semaphore)
+                async def run_file_processing():
+                    # Async style inference (Layer 3)
+                    # Skip for same-language localization — style-driven restructuring
+                    # (first-person prefixes, phrase-form enforcement) must not run when
+                    # the task is dialect adaptation, not full translation.
+                    if not context.is_same_language_localization:
+                        status_text.text("Inferring block styles...")
+                        await infer_block_styles_async(context, global_context, semaphore)
 
-                # Batch-translate scale labels (one LLM call per block)
-                if context.blocks:
-                    # Pre-translate question rows for blocks with scales so the
-                    # scale batch call can align vocabulary with the translated stem.
-                    scale_blocks = [
-                        b for b in context.blocks
-                        if b.scale_label_indices and len(b.scale_label_indices) >= 2
-                    ]
-                    if scale_blocks:
-                        status_text.text("Pre-translating question stems for scale blocks...")
-                        q_tasks = []
-                        q_block_map: Dict[int, List[int]] = {}
-                        for block in scale_blocks:
-                            q_indices = [
-                                i for i in block.question_indices
-                                if 0 <= i < len(context.rows) and (context.rows[i].english_text or "").strip()
-                            ]
-                            if q_indices:
-                                q_block_map[block.block_id] = q_indices
-                                for qi in q_indices:
-                                    qrow = context.rows[qi]
-                                    if qrow.had_real_translation and not provide_suggestions:
-                                        qrow.new_translation = qrow.existing_translation
-                                        qrow.batch_translated = True
-                                    else:
-                                        q_tasks.append(
-                                            call_translation_model_async(
-                                                english_text=qrow.english_text,
-                                                language_code=context.language_code,
-                                                locale_code=context.locale_code,
-                                                global_context=global_context,
-                                                translation_memory=context.translation_memory,
-                                                existing_translation=qrow.existing_translation if qrow.had_real_translation else None,
-                                                segment_type=qrow.segment_type,
-                                                block_style=(context.block_styles.get(qrow.block_id) if context.block_styles and qrow.block_id is not None else None),
-                                                gender_inclusive=gender_inclusive,
-                                                is_same_language_localization=context.is_same_language_localization,
-                                            )
-                                        )
-                        if q_tasks:
-                            q_results = await asyncio.gather(*q_tasks, return_exceptions=True)
-                            result_iter = iter(q_results)
+                    # Batch-translate scale labels (one LLM call per block)
+                    if context.blocks:
+                        # Pre-translate question rows for blocks with scales so the
+                        # scale batch call can align vocabulary with the translated stem.
+                        scale_blocks = [
+                            b for b in context.blocks
+                            if b.scale_label_indices and len(b.scale_label_indices) >= 2
+                        ]
+                        if scale_blocks:
+                            status_text.text("Pre-translating question stems for scale blocks...")
+                            q_tasks = []
+                            q_block_map: Dict[int, List[int]] = {}
                             for block in scale_blocks:
-                                for qi in q_block_map.get(block.block_id, []):
-                                    qrow = context.rows[qi]
-                                    if qrow.batch_translated:
-                                        continue
-                                    result = next(result_iter)
-                                    if isinstance(result, Exception):
-                                        continue
-                                    proposed = result.get("qa_checked_translation") or result.get("proposed_translation") or ""
-                                    if not proposed:
-                                        continue
-                                    eng = (qrow.english_text or "").strip()
-                                    is_ok, _ = validate_translation_structure(eng, proposed)
-                                    if not is_ok:
-                                        repaired = attempt_placeholder_repair(eng, proposed)
-                                        if repaired:
-                                            re_ok, _ = validate_translation_structure(eng, repaired)
-                                            if re_ok:
-                                                proposed = repaired
-                                                is_ok = True
-                                    if not qrow.had_real_translation:
-                                        qrow.new_translation = proposed
-                                        qrow.was_newly_translated = True
-                                    else:
-                                        qrow.new_translation = qrow.existing_translation
-                                        if result.get("needs_change") and proposed != qrow.existing_translation:
-                                            if provide_suggestions:
-                                                qrow.suggested_translation = proposed
-                                                qrow.suggestion_reason = result.get("change_reason", "")
-                                            else:
-                                                qrow.new_translation = proposed
-                                    qrow.batch_translated = True
+                                q_indices = [
+                                    i for i in block.question_indices
+                                    if 0 <= i < len(context.rows) and (context.rows[i].english_text or "").strip()
+                                ]
+                                if q_indices:
+                                    q_block_map[block.block_id] = q_indices
+                                    for qi in q_indices:
+                                        qrow = context.rows[qi]
+                                        if qrow.had_real_translation and not provide_suggestions:
+                                            qrow.new_translation = qrow.existing_translation
+                                            qrow.batch_translated = True
+                                        else:
+                                            q_tasks.append(
+                                                call_translation_model_async(
+                                                    english_text=qrow.english_text,
+                                                    language_code=context.language_code,
+                                                    locale_code=context.locale_code,
+                                                    global_context=global_context,
+                                                    translation_memory=context.translation_memory,
+                                                    existing_translation=qrow.existing_translation if qrow.had_real_translation else None,
+                                                    segment_type=qrow.segment_type,
+                                                    block_style=(context.block_styles.get(qrow.block_id) if context.block_styles and qrow.block_id is not None else None),
+                                                    gender_inclusive=gender_inclusive,
+                                                    is_same_language_localization=context.is_same_language_localization,
+                                                )
+                                            )
+                            if q_tasks:
+                                q_results = await asyncio.gather(*q_tasks, return_exceptions=True)
+                                result_iter = iter(q_results)
+                                for block in scale_blocks:
+                                    for qi in q_block_map.get(block.block_id, []):
+                                        qrow = context.rows[qi]
+                                        if qrow.batch_translated:
+                                            continue
+                                        result = next(result_iter)
+                                        if isinstance(result, Exception):
+                                            continue
+                                        proposed = result.get("qa_checked_translation") or result.get("proposed_translation") or ""
+                                        if not proposed:
+                                            continue
+                                        eng = (qrow.english_text or "").strip()
+                                        is_ok, _ = validate_translation_structure(eng, proposed)
+                                        if not is_ok:
+                                            repaired = attempt_placeholder_repair(eng, proposed)
+                                            if repaired:
+                                                re_ok, _ = validate_translation_structure(eng, repaired)
+                                                if re_ok:
+                                                    proposed = repaired
+                                                    is_ok = True
+                                        if not qrow.had_real_translation:
+                                            qrow.new_translation = proposed
+                                            qrow.was_newly_translated = True
+                                        else:
+                                            qrow.new_translation = qrow.existing_translation
+                                            if result.get("needs_change") and proposed != qrow.existing_translation:
+                                                if provide_suggestions:
+                                                    qrow.suggested_translation = proposed
+                                                    qrow.suggestion_reason = result.get("change_reason", "")
+                                                else:
+                                                    qrow.new_translation = proposed
+                                        qrow.batch_translated = True
 
-                    status_text.text("Translating scale labels...")
-                    scale_tasks = []
-                    for block in scale_blocks:
-                        translated_q = " ".join(
-                            (context.rows[i].new_translation or context.rows[i].existing_translation or "")
-                            for i in block.question_indices
-                            if 0 <= i < len(context.rows)
-                        ).strip()
-                        scale_tasks.append(
-                            translate_scale_batch_async(
-                                context, block, global_context, semaphore,
-                                provide_suggestions, gender_inclusive=gender_inclusive,
-                                translated_question_context=translated_q,
+                        status_text.text("Translating scale labels...")
+                        scale_tasks = []
+                        for block in scale_blocks:
+                            translated_q = " ".join(
+                                (context.rows[i].new_translation or context.rows[i].existing_translation or "")
+                                for i in block.question_indices
+                                if 0 <= i < len(context.rows)
+                            ).strip()
+                            scale_tasks.append(
+                                translate_scale_batch_async(
+                                    context, block, global_context, semaphore,
+                                    provide_suggestions, gender_inclusive=gender_inclusive,
+                                    translated_question_context=translated_q,
+                                )
                             )
+                        if scale_tasks:
+                            await asyncio.gather(*scale_tasks, return_exceptions=True)
+
+                    tasks = []
+                    total_rows = len(context.rows)
+
+                    # Create tasks (batch-translated rows will return immediately)
+                    for row in context.rows:
+                        tasks.append(process_row_async(row, context, global_context, semaphore, provide_suggestions, gender_inclusive=gender_inclusive))
+
+                    # Run tasks and update UI incrementally
+                    completed_count = 0
+                    for f in asyncio.as_completed(tasks):
+                        row = await f
+                        completed_count += 1
+
+                        # Update Progress
+                        progress = completed_count / total_rows
+                        progress_bar.progress(progress)
+                        status_text.text(f"Processed {completed_count}/{total_rows} rows...")
+
+                        # Update Live Preview (Every 2 rows for smoother feedback)
+                        if completed_count % 2 == 0:
+                            eng_preview = (row.english_text or "")
+                            new_preview = (row.new_translation or row.existing_translation or "")
+
+                            preview_data.append({
+                                "English Source": eng_preview,
+                                "Translation": new_preview
+                            })
+
+                            # CHANGE 2: Overwrite the placeholder
+                            live_table_placeholder.dataframe(
+                                pd.DataFrame(preview_data[-5:]),
+                                use_container_width=True,
+                                hide_index=True
+                            )
+
+                    # Post-translation style re-check (skip for dialect adaptation)
+                    if not context.is_same_language_localization:
+                        status_text.text("Running style re-check...")
+                        restyle_count = await restyle_mismatched_rows(
+                            context, global_context, semaphore,
+                            gender_inclusive=gender_inclusive,
+                            provide_suggestions=provide_suggestions,
                         )
-                    if scale_tasks:
-                        await asyncio.gather(*scale_tasks, return_exceptions=True)
+                        if restyle_count:
+                            status_text.text(f"Style re-check: {restyle_count} rows re-translated for style alignment.")
 
-                tasks = []
-                total_rows = len(context.rows)
+                # Execute the async loop
+                loop.run_until_complete(run_file_processing())
 
-                # Create tasks (batch-translated rows will return immediately)
-                for row in context.rows:
-                    tasks.append(process_row_async(row, context, global_context, semaphore, provide_suggestions, gender_inclusive=gender_inclusive))
+                # Post-processing: strip question punctuation from answer options
+                qmark_fixes = strip_question_punctuation_from_options(context)
+                if qmark_fixes:
+                    status_text.text(f"Post-processing: removed question punctuation from {qmark_fixes} answer option(s).")
 
-                # Run tasks and update UI incrementally
-                completed_count = 0
-                for f in asyncio.as_completed(tasks):
-                    row = await f
-                    completed_count += 1
+                # Dialect adaptation post-processing
+                if context.is_same_language_localization:
+                    punct_fixes = preserve_source_punctuation(context)
+                    if punct_fixes:
+                        status_text.text(f"Post-processing: restored punctuation on {punct_fixes} row(s).")
 
-                    # Update Progress
-                    progress = completed_count / total_rows
-                    progress_bar.progress(progress)
-                    status_text.text(f"Processed {completed_count}/{total_rows} rows...")
+                    spelling_fixes = apply_dialect_spelling_corrections(context)
+                    if spelling_fixes:
+                        status_text.text(f"Post-processing: applied {spelling_fixes} deterministic spelling correction(s).")
 
-                    # Update Live Preview (Every 2 rows for smoother feedback)
-                    if completed_count % 2 == 0:
-                        eng_preview = (row.english_text or "")
-                        new_preview = (row.new_translation or row.existing_translation or "")
+                # Post-processing
+                status_text.text("Running Consistency Pass & Style Checks...")
 
-                        preview_data.append({
-                            "English Source": eng_preview,
-                            "Translation": new_preview
-                        })
+                # Only do style warnings / suggestion columns when enabled
+                # (skip entirely for dialect adaptation — no style enforcement)
+                if provide_suggestions and not context.is_same_language_localization:
+                    block_style_validation(context)
 
-                        # CHANGE 2: Overwrite the placeholder
-                        live_table_placeholder.dataframe(
-                            pd.DataFrame(preview_data[-5:]),
-                            use_container_width=True,
-                            hide_index=True
-                        )
+                # Consistency pass should run regardless; when suggestions are OFF,
+                # apply the canonical form only to rows translated in this run.
+                if enable_consistency:
+                    try:
+                        consistency_pass(context, apply_to_new_translations=(not provide_suggestions), global_context=global_context)
+                    except Exception as _cp_err:
+                        st.warning(f"Consistency pass skipped for {file.name} due to an error: {_cp_err}")
 
-                # Post-translation style re-check (skip for dialect adaptation)
-                if not context.is_same_language_localization:
-                    status_text.text("Running style re-check...")
-                    restyle_count = await restyle_mismatched_rows(
-                        context, global_context, semaphore,
-                        gender_inclusive=gender_inclusive,
-                        provide_suggestions=provide_suggestions,
+                out_df, out_filename, excel_bytes = write_output_file(
+                    context, original_df, include_suggestions=provide_suggestions
+                )
+
+                # Calculate Stats
+                n_new = sum(1 for r in context.rows if r.was_newly_translated)
+                n_sugg = (
+                    sum(
+                        1
+                        for r in context.rows
+                        if (r.suggested_translation or (r.suggestion_reason or "").strip())
                     )
-                    if restyle_count:
-                        status_text.text(f"Style re-check: {restyle_count} rows re-translated for style alignment.")
-
-            # Execute the async loop
-            loop.run_until_complete(run_file_processing())
-
-            # Post-processing: strip question punctuation from answer options
-            qmark_fixes = strip_question_punctuation_from_options(context)
-            if qmark_fixes:
-                status_text.text(f"Post-processing: removed question punctuation from {qmark_fixes} answer option(s).")
-
-            # Dialect adaptation post-processing
-            if context.is_same_language_localization:
-                punct_fixes = preserve_source_punctuation(context)
-                if punct_fixes:
-                    status_text.text(f"Post-processing: restored punctuation on {punct_fixes} row(s).")
-
-                spelling_fixes = apply_dialect_spelling_corrections(context)
-                if spelling_fixes:
-                    status_text.text(f"Post-processing: applied {spelling_fixes} deterministic spelling correction(s).")
-
-            # Post-processing
-            status_text.text("Running Consistency Pass & Style Checks...")
-
-            # Only do style warnings / suggestion columns when enabled
-            # (skip entirely for dialect adaptation — no style enforcement)
-            if provide_suggestions and not context.is_same_language_localization:
-                block_style_validation(context)
-
-            # Consistency pass should run regardless; when suggestions are OFF,
-            # apply the canonical form only to rows translated in this run.
-            if enable_consistency:
-                consistency_pass(context, apply_to_new_translations=(not provide_suggestions), global_context=global_context)
-
-            out_df, out_filename, excel_bytes = write_output_file(
-                context, original_df, include_suggestions=provide_suggestions
-            )
-
-            # Calculate Stats
-            n_new = sum(1 for r in context.rows if r.was_newly_translated)
-            n_sugg = (
-                sum(
+                    if provide_suggestions
+                    else 0
+                )
+                n_err = sum(
                     1
                     for r in context.rows
-                    if (r.suggested_translation or (r.suggestion_reason or "").strip())
-                )
-                if provide_suggestions
-                else 0
-            )
-            n_err = sum(
-                1
-                for r in context.rows
-                if (r.suggestion_reason or "").startswith("LLM Error")
-                or "translation likely failed" in (r.suggestion_reason or "")
-            )
-
-            result = {
-                "file_name": file.name,
-                "out_filename": out_filename,
-                "excel_bytes": excel_bytes,
-                "num_new_translations": n_new,
-                "num_suggestions": n_sugg,
-                "num_error_rows": n_err,
-                "is_same_language_localization": context.is_same_language_localization,
-            }
-
-            # Immediately persist to session state so the download survives
-            # even if a later file errors out
-            st.session_state["processed_results"].append(result)
-
-            st.success(f"Completed {file.name}!")
-
-            # Render download in a fragment so clicking it won't cancel the
-            # processing loop for remaining files.
-            _dl_idx = len(st.session_state["processed_results"]) - 1
-
-            @st.fragment
-            def _inline_download(idx=_dl_idx):
-                res = st.session_state["processed_results"][idx]
-                st.download_button(
-                    label=f"Download: {res['out_filename']}",
-                    data=res["excel_bytes"],
-                    file_name=res["out_filename"],
-                    mime="application/vnd.ms-excel",
-                    key=f"download_inline_{res['file_name']}",
+                    if (r.suggestion_reason or "").startswith("LLM Error")
+                    or "translation likely failed" in (r.suggestion_reason or "")
+                    or "STRUCTURE FLAG" in (r.suggestion_reason or "")
+                    or "Structure validation warning" in (r.suggestion_reason or "")
                 )
 
-            _inline_download()
+                result = {
+                    "file_name": file.name,
+                    "out_filename": out_filename,
+                    "excel_bytes": excel_bytes,
+                    "num_new_translations": n_new,
+                    "num_suggestions": n_sugg,
+                    "num_error_rows": n_err,
+                    "is_same_language_localization": context.is_same_language_localization,
+                }
+
+                # Immediately persist to session state so the download survives
+                # even if a later file errors out
+                st.session_state["processed_results"].append(result)
+
+                st.success(f"Completed {file.name}!")
+
+                # Render download in a fragment so clicking it won't cancel the
+                # processing loop for remaining files.
+                _dl_idx = len(st.session_state["processed_results"]) - 1
+
+                @st.fragment
+                def _inline_download(idx=_dl_idx):
+                    res = st.session_state["processed_results"][idx]
+                    st.download_button(
+                        label=f"Download: {res['out_filename']}",
+                        data=res["excel_bytes"],
+                        file_name=res["out_filename"],
+                        mime="application/vnd.ms-excel",
+                        key=f"download_inline_{res['file_name']}",
+                    )
+
+                _inline_download()
+
+            except Exception as _file_err:
+                fname = getattr(cfg.get('file'), 'name', str(cfg.get('file', '?')))
+                st.error(f"Failed to process {fname}: {_file_err}")
+                continue
 
     # After possible run, render download buttons from cached results
     processed_results: List[Dict[str, object]] = st.session_state.get("processed_results", [])
@@ -4092,7 +4229,7 @@ to:
                 f"Finished processing `{res['file_name']}`. "
                 f"{new_label}: {res['num_new_translations']} | "
                 f"Rows with suggestions/warnings: {res['num_suggestions']} | "
-                f"Rows with LLM errors: {res['num_error_rows']}"
+                f"Rows needing review (errors/structure flags): {res['num_error_rows']}"
             )
 
             st.download_button(
