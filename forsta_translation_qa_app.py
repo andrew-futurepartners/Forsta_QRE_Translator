@@ -49,6 +49,31 @@ def get_async_client() -> "AsyncOpenAI":
     return _async_client
 
 
+def reset_async_client() -> None:
+    """Null the cached async client so the next call to get_async_client()
+    creates a fresh instance bound to the current event loop.  Call once
+    before creating the run loop and once after closing it."""
+    global _async_client
+    _async_client = None
+
+
+# Per-run translation dedup cache.  Keyed on every output-affecting argument so
+# identical English in identical context triggers exactly ONE model call; peers
+# await the lock and reuse the cached result.  Reset at the start of each run
+# via reset_translation_cache() so cross-run state never leaks.
+_TRANSLATION_CACHE: Dict[tuple, dict] = {}
+_TRANSLATION_CACHE_LOCKS: Dict[tuple, "asyncio.Lock"] = {}
+
+
+def reset_translation_cache() -> None:
+    """Clear the per-run translation dedup cache.  Must be called once at the
+    start of each run (before the event loop is entered) so stale results from
+    a previous run never propagate."""
+    global _TRANSLATION_CACHE, _TRANSLATION_CACHE_LOCKS
+    _TRANSLATION_CACHE = {}
+    _TRANSLATION_CACHE_LOCKS = {}
+
+
 # ==========================
 # Configuration & Constants
 # ==========================
@@ -579,6 +604,9 @@ class SurveyRow:
     block_id: Optional[int] = None
     # True if this row was translated as part of a batch scale call
     batch_translated: bool = False
+    # Read-only structural audit of the FINAL shipped value (set by audit_shipped_rows).
+    # Never gates output — advisory column only.
+    qa_status: Optional[str] = None
 
 @dataclass
 class QuestionBlock:
@@ -1332,7 +1360,7 @@ def sample_translation_memory_examples(
     return examples
 
 
-async def call_translation_model_async(
+async def _call_translation_model_async_uncached(
         english_text: str,
         language_code: str,
         locale_code: str,
@@ -1768,6 +1796,85 @@ Your response:
     }
 
 
+async def call_translation_model_async(
+        english_text: str,
+        language_code: str,
+        locale_code: str,
+        global_context: str,
+        translation_memory: Dict[str, Dict[str, str]],
+        existing_translation: Optional[str] = None,
+        segment_type: Optional[SegmentType] = None,
+        block_style: Optional[BlockStyle] = None,
+        peer_english_options: Optional[List[str]] = None,
+        parent_context: str = "",
+        gender_inclusive: bool = False,
+        model_name: str = TRANSLATION_MODEL_NAME,
+        answer_option_count: int = 0,
+        answer_option_avg_len: float = 0.0,
+        is_same_language_localization: bool = False,
+) -> Dict[str, object]:
+    """Per-run dedup-caching front for _call_translation_model_async_uncached.
+
+    Identical (english_text, context-args) tuples share one model call within a
+    run; the lock prevents concurrent requests for the same key from each making
+    a separate call.  Cache is reset by reset_translation_cache() at run start.
+    """
+
+    def _bs_sig(bs: Optional[BlockStyle]):
+        if not bs:
+            return None
+        return (bs.options_grammatical_person, bs.options_phrase_form,
+                bs.options_tone, bs.scale_label_phrase_form)
+
+    key: tuple = (
+        english_text, language_code, locale_code,
+        segment_type.value if segment_type else None,
+        bool(gender_inclusive), bool(is_same_language_localization),
+        _bs_sig(block_style), parent_context or "",
+        tuple(peer_english_options) if peer_english_options else None,
+        existing_translation or "",
+        answer_option_count, round(answer_option_avg_len, 1),
+        model_name,
+        # global_context included so a CRITICAL-RETRY suffix (which appends to
+        # global_context) always gets its own cache slot, never collides.
+        global_context,
+    )
+
+    cached = _TRANSLATION_CACHE.get(key)
+    if cached is not None:
+        return dict(cached)
+
+    # Create the lock inside the active event loop (per-run) so it never
+    # accidentally binds to a prior run's loop.
+    lock = _TRANSLATION_CACHE_LOCKS.get(key)
+    if lock is None:
+        lock = asyncio.Lock()
+        _TRANSLATION_CACHE_LOCKS[key] = lock
+
+    async with lock:
+        # Double-check: another coroutine may have populated the cache while
+        # we waited for the lock.
+        cached = _TRANSLATION_CACHE.get(key)
+        if cached is not None:
+            return dict(cached)
+
+        result = await _call_translation_model_async_uncached(
+            english_text, language_code, locale_code, global_context,
+            translation_memory, existing_translation, segment_type, block_style,
+            peer_english_options, parent_context, gender_inclusive, model_name,
+            answer_option_count, answer_option_avg_len, is_same_language_localization,
+        )
+
+        # Cache only clean, non-English-copy output.  Errors and English-copies
+        # are never cached so peers retry them independently rather than all
+        # inheriting a known-bad result.
+        candidate = result.get("qa_checked_translation") or result.get("proposed_translation") or ""
+        if not result.get("error") and not is_effective_copy_of_english(english_text, candidate):
+            _TRANSLATION_CACHE[key] = dict(result)
+
+        return result
+
+
 async def translate_scale_batch_async(
     context: SurveyFileContext,
     block: QuestionBlock,
@@ -2026,31 +2133,44 @@ one for each English label, in the same order."""
 
                 notes = data.get("notes", "")
 
-                translated_count = 0
+                # Phase 1: stage every label — never commit partially.
+                # A single empty or structurally-invalid label causes the whole
+                # set to fall back to the row-by-row path (set_incomplete=True).
+                staged: Dict[int, str] = {}
+                set_incomplete = False
                 for i, idx in enumerate(scale_indices):
                     row = rows[idx]
                     proposed = (translations[i] or "").strip()
                     if not proposed:
+                        set_incomplete = True
                         continue
-
                     eng = (row.english_text or "").strip()
                     proposed = adjust_capitalization_for_label(eng, proposed, context.language_code)
-
                     is_ok, msg = validate_translation_structure(eng, proposed)
                     if not is_ok:
                         repaired = attempt_placeholder_repair(eng, proposed)
                         if repaired and repaired != proposed:
                             re_valid, _ = validate_translation_structure(eng, repaired)
                             if re_valid:
-                                proposed = repaired
-                                is_ok = True
+                                proposed, is_ok = repaired, True
                         if not is_ok:
-                            row.suggestion_reason = (
-                                (row.suggestion_reason or "") +
-                                f"Batch scale structure warning: {msg}"
-                            )
+                            set_incomplete = True
                             continue
+                    staged[idx] = proposed
 
+                # Phase 2: atomic commit or flag-and-fallback.
+                if set_incomplete or len(staged) != len(scale_indices):
+                    for idx in scale_indices:
+                        rows[idx].suggestion_reason = (
+                            ((rows[idx].suggestion_reason + " | ") if rows[idx].suggestion_reason else "")
+                            + "Scale set incomplete — review whole scale."
+                        )
+                    return 0  # batch_translated stays False -> coherent row-by-row fallback
+
+                translated_count = 0
+                for i, idx in enumerate(scale_indices):
+                    row = rows[idx]
+                    proposed = staged[idx]
                     if not row.had_real_translation:
                         row.new_translation = proposed
                         row.was_newly_translated = True
@@ -2066,7 +2186,6 @@ one for each English label, in the same order."""
                                 )
                             else:
                                 row.new_translation = proposed
-
                     row.batch_translated = True
                     translated_count += 1
 
@@ -2654,20 +2773,22 @@ def extract_numeric_tokens(text: str) -> List[str]:
     return re.findall(pattern, text)
 
 
+# Shared placeholder-token regex: no-space inner content so prose phrases like
+# "[see below]" are NOT treated as piping tokens.  Used by both the validator
+# (extract_placeholder_tokens) and the repairer (attempt_placeholder_repair) so
+# they are always in lockstep and cannot diverge on what counts as a token.
+_PLACEHOLDER_TOKEN_RE = re.compile(
+    r'\[\[[^\]\s]+\]\]'            # [[VAR]]   - double-bracket, no spaces
+    r'|\{[^}\s]+\}'               # {token}   - curly brace, no spaces
+    r'|\[[^\]\s]+\]'              # [token]   - single bracket, no spaces
+    r'|\$[A-Za-z][A-Za-z0-9_]+'   # $VAR / $RESP
+)
+
+
 def extract_placeholder_tokens(text: str) -> List[str]:
     if not text:
         return []
-    tokens: List[str] = []
-    patterns = [
-        r'\{[^}]+\}',      # {placeholder}
-        r'\[[^\]]+\]',     # [placeholder]
-        r'\$[A-Z][A-Z_]+',  # $VARNAME (uppercase, 2+ chars -- excludes $25, $150)
-        r'\[\[\w+\]\]',    # [[VARNAME]]
-    ]
-    for pat in patterns:
-        tokens.extend(re.findall(pat, text))
-    # Deduplicate
-    return sorted(set(tokens))
+    return sorted(set(_PLACEHOLDER_TOKEN_RE.findall(text)))
 
 
 # HTML-tag fidelity: match opening and closing tags (e.g. <b>, </b>, <br>, <a href="...">).
@@ -2760,6 +2881,30 @@ def validate_translation_structure(english_text: str, translation_text: str) -> 
         return False, msg
 
     return True, ""
+
+
+def audit_shipped_rows(context: "SurveyFileContext") -> int:
+    """Read-only structural audit of the FINAL shipped value of every row,
+    including preserved and dialect/batch-skipped rows.
+
+    Writes row.qa_status; NEVER mutates row text or new_translation.
+    Language-agnostic (reuses validate_translation_structure which covers
+    numerics, ranges, placeholders, and HTML tags).
+    Returns the number of rows flagged.
+    """
+    flagged = 0
+    for row in context.rows:
+        eng = (row.english_text or "")
+        final = row.new_translation if row.new_translation is not None else row.existing_translation
+        final = str(final) if final is not None else ""
+        if not eng.strip() or not final.strip():
+            row.qa_status = ""
+            continue
+        ok, msg = validate_translation_structure(eng, final)
+        row.qa_status = "" if ok else f"REVIEW: {msg}"
+        if not ok:
+            flagged += 1
+    return flagged
 
 
 def strip_question_punctuation_from_options(context: "SurveyFileContext") -> int:
@@ -2880,36 +3025,32 @@ def validate_abbreviation_preservation(english_text: str, translation_text: str)
 
 def attempt_placeholder_repair(english_text: str, translation: str) -> str:
     """
-    If the translation is missing placeholder tokens from the English source,
-    attempt to re-insert them at the most likely position.
+    If the translation is missing EXACTLY ONE placeholder token from the English
+    source AND there is a confident comma-gap anchor, re-insert it there.
 
-    Handles [TOKEN], {TOKEN}, and [[TOKEN]] patterns. Language-agnostic.
+    Uses the same _PLACEHOLDER_TOKEN_RE as extract_placeholder_tokens so validator
+    and repairer are always in lockstep.  When more than one token is missing, or
+    when no reliable anchor exists, returns the translation unmutated so the caller
+    can flag the row without shipping a wrong positional guess.
+    Language-agnostic.
     """
-    eng_placeholders = re.findall(r'\[\[[^\]]+\]\]|\[[A-Z_]+\]|\{[A-Z_]+\}', english_text)
-    repaired = translation
+    translation = translation or ""
+    eng_tokens = _PLACEHOLDER_TOKEN_RE.findall(english_text or "")
+    missing = [t for t in eng_tokens if t not in translation]
 
-    for placeholder in eng_placeholders:
-        if placeholder not in repaired:
-            # Look for a gap where the LLM translated around the placeholder
-            # (e.g., "avec , quelle" where the placeholder was dropped)
-            gap_pattern = r'(\S)\s{0,2},\s+(?=\S)'
-            gap_match = re.search(gap_pattern, repaired)
-            if gap_match:
-                insert_pos = gap_match.start() + len(gap_match.group(1))
-                repaired = repaired[:insert_pos] + f" {placeholder}" + repaired[insert_pos:]
-            else:
-                # Fallback: find the placeholder's position in English and mirror
-                # roughly the same proportional position in the translation
-                eng_idx = english_text.find(placeholder)
-                if eng_idx >= 0 and len(english_text) > 0:
-                    ratio = eng_idx / len(english_text)
-                    insert_pos = int(ratio * len(repaired))
-                    # Snap to nearest word boundary
-                    while insert_pos < len(repaired) and repaired[insert_pos] not in ' \t':
-                        insert_pos += 1
-                    repaired = repaired[:insert_pos] + f" {placeholder}" + repaired[insert_pos:]
+    # Only auto-repair a single missing token with a confident neighbor anchor.
+    if len(missing) != 1:
+        return translation                   # leave unmutated -> caller flags
 
-    return repaired
+    placeholder = missing[0]
+    # Anchor: a gap like "avec , quelle" where the LLM translated around the token
+    gap_match = re.search(r'(\S)\s{0,2},\s+(?=\S)', translation)
+    if gap_match:
+        insert_pos = gap_match.start() + len(gap_match.group(1))
+        return translation[:insert_pos] + f" {placeholder}" + translation[insert_pos:]
+
+    # No reliable anchor -> leave unmutated rather than guessing a position
+    return translation
 
 
 # ==========================
@@ -3305,7 +3446,15 @@ async def process_row_async(
             # For new rows, ship a visible sentinel rather than blank or plain English.
             row.new_translation = row.existing_translation or "[TRANSLATION FAILED — REVIEW]"
         elif not row.had_real_translation:
-            # New Translation
+            # New Translation — guard empty output before writing anything.
+            if not proposed.strip():
+                row.new_translation = "[TRANSLATION FAILED — REVIEW]"
+                row.was_newly_translated = True
+                row.suggestion_reason = (
+                    ((row.suggestion_reason + " | ") if row.suggestion_reason else "")
+                    + "LLM Error: model returned an empty translation for a new row."
+                )
+                return row
             row.new_translation = adjust_capitalization_for_label(eng_text, proposed, context.language_code)
             row.was_newly_translated = True
             existing = (row.existing_translation or "").strip()
@@ -3460,20 +3609,37 @@ def consistency_pass(context: SurveyFileContext, apply_to_new_translations: bool
 
     Groups similar English phrases (e.g. "Select one." and "select one")
     to ensure they are translated consistently.
+
+    Key hardening over the original:
+    - Grouping key is (normalize_fuzzy(eng), segment_type, parent-question hash)
+      so homographs with different senses in different blocks are never merged.
+    - Applies the canonical ONLY to indices_to_update (not all group indices).
+    - Deterministic canonical when nothing is locked (most-frequent; tie -> lowest index).
+    - Re-validates the canonical against each target row's English before writing
+      so a structure-breaking canonical is never applied.
     """
 
-    # Helper for fuzzy normalization
     def normalize_fuzzy(text: str) -> str:
-        # Lowercase and remove punctuation/whitespace
         return text.lower().translate(str.maketrans('', '', string.punctuation)).replace(" ", "")
 
-    # Map: fuzzy_key -> { original_english -> { translation -> [indices] } }
-    fuzzy_map: Dict[str, Dict[str, Dict[str, List[int]]]] = {}
+    def _parent_hash(row: SurveyRow) -> str:
+        """Short hash of the parent question(s) for this row's block (context-aware grouping)."""
+        if context.blocks and row.block_id is not None and 0 <= row.block_id < len(context.blocks):
+            blk = context.blocks[row.block_id]
+            q = " ".join(
+                normalize_fuzzy(context.rows[i].english_text or "")
+                for i in blk.question_indices
+                if 0 <= i < len(context.rows)
+            )
+            return q[:64]
+        return ""
+
+    # Map: (fuzzy_norm_eng, segment_type, parent_hash) -> { original_english -> { translation -> [indices] } }
+    fuzzy_map: Dict[tuple, Dict[str, Dict[str, List[int]]]] = {}
 
     for idx, row in enumerate(context.rows):
         eng = (row.english_text or "").strip()
 
-        # Skip rows already flagged for structural issues or empty translations
         if "Structure validation warning" in (row.suggestion_reason or ""):
             continue
 
@@ -3481,29 +3647,26 @@ def consistency_pass(context: SurveyFileContext, apply_to_new_translations: bool
         if not eng or not trl:
             continue
 
-        fuzzy_key = normalize_fuzzy(eng)
+        seg = row.segment_type.value if row.segment_type else ""
+        fuzzy_key: tuple = (normalize_fuzzy(eng), seg, _parent_hash(row))
 
-        if fuzzy_key not in fuzzy_map: fuzzy_map[fuzzy_key] = {}
-        if eng not in fuzzy_map[fuzzy_key]: fuzzy_map[fuzzy_key][eng] = {}
-        if trl not in fuzzy_map[fuzzy_key][eng]: fuzzy_map[fuzzy_key][eng][trl] = []
-
+        if fuzzy_key not in fuzzy_map:
+            fuzzy_map[fuzzy_key] = {}
+        if eng not in fuzzy_map[fuzzy_key]:
+            fuzzy_map[fuzzy_key][eng] = {}
+        if trl not in fuzzy_map[fuzzy_key][eng]:
+            fuzzy_map[fuzzy_key][eng][trl] = []
         fuzzy_map[fuzzy_key][eng][trl].append(idx)
 
-    # Convert the fuzzy map into phrase_groups for the LLM
     phrase_groups = []
     for fuzzy_key, eng_variants in fuzzy_map.items():
-        # Aggregate all translations for this fuzzy meaning
-        all_translations = {}  # translation -> indices
-
-        # Pick the most common English variant as the "display" phrase, or just the first one
+        all_translations: Dict[str, List[int]] = {}
         primary_english = list(eng_variants.keys())[0]
-
         for original_eng, trl_dict in eng_variants.items():
             for trl, indices in trl_dict.items():
-                if trl not in all_translations: all_translations[trl] = []
+                if trl not in all_translations:
+                    all_translations[trl] = []
                 all_translations[trl].extend(indices)
-
-        # Only send to LLM if there is more than 1 distinct translation for this concept
         if len(all_translations) > 1:
             phrase_groups.append({
                 "english_phrase": primary_english,
@@ -3511,80 +3674,84 @@ def consistency_pass(context: SurveyFileContext, apply_to_new_translations: bool
             })
 
     if not phrase_groups:
-        return  # nothing to do
+        return
 
-    # Ask the LLM to decide canonical translations and which indices to update
     issues = call_consistency_model(context, phrase_groups, global_context=global_context)
 
-    # Lookup so we can see all indices/translations for an english_phrase
-    group_lookup = {g["english_phrase"]: g for g in phrase_groups}
-
     for issue in issues:
-        english_phrase = issue.get("english_phrase", "")
         canonical = (issue.get("canonical_translation") or "").strip()
-        indices_to_update = issue.get("indices_to_update") or []
+        indices_to_update = [
+            i for i in (issue.get("indices_to_update") or [])
+            if isinstance(i, int) and 0 <= i < len(context.rows)
+        ]
         notes = issue.get("notes") or ""
 
-        # If the model says "don't unify", it should return no indices.
         if not canonical or not indices_to_update:
             continue
 
-        group = group_lookup.get(english_phrase)
-        if not group:
+        # Match by index overlap (robust to homographs with different fuzzy_key tuples).
+        group = None
+        want = set(indices_to_update)
+        for g in phrase_groups:
+            gi = {
+                i
+                for t in g.get("translations", [])
+                for i in (t.get("indices") or [])
+                if isinstance(i, int)
+            }
+            if want & gi:
+                group = g
+                break
+        if group is None:
             continue
+        english_phrase = group.get("english_phrase", "")
 
-        # Prefer an existing (pre-run) translation as canonical if present,
-        # because we do NOT want to rewrite old translations when suggestions are off.
+        # Prefer a locked (pre-existing) translation; else deterministic pick.
         locked_counts: Dict[str, int] = {}
         for t in group.get("translations", []):
             trl = (t.get("translation") or "").strip()
             for idx in (t.get("indices") or []):
-                if isinstance(idx, int) and 0 <= idx < len(context.rows):
-                    if not context.rows[idx].was_newly_translated and trl:
-                        locked_counts[trl] = locked_counts.get(trl, 0) + 1
+                if isinstance(idx, int) and 0 <= idx < len(context.rows) \
+                        and not context.rows[idx].was_newly_translated and trl:
+                    locked_counts[trl] = locked_counts.get(trl, 0) + 1
 
-        canonical_to_apply = max(locked_counts, key=locked_counts.get) if locked_counts else canonical
+        if locked_counts:
+            canonical_to_apply = max(locked_counts, key=locked_counts.get)
+        else:
+            freq: Dict[str, int] = {}
+            first_idx: Dict[str, int] = {}
+            for idx in sorted(indices_to_update):
+                trl = (context.rows[idx].new_translation or context.rows[idx].existing_translation or "").strip()
+                if not trl:
+                    continue
+                freq[trl] = freq.get(trl, 0) + 1
+                first_idx.setdefault(trl, idx)
+            if freq:
+                canonical_to_apply = max(freq, key=lambda k: (freq[k], -first_idx[k]))
+            else:
+                canonical_to_apply = canonical
 
-        # Update *all* rows in this group (not only indices_to_update),
-        # but ONLY those that were newly translated in this run, and only if the model
-        # decided the group should be unified (indices_to_update non-empty).
-        all_group_indices = set()
-        for t in group.get("translations", []):
-            for idx in (t.get("indices") or []):
-                if isinstance(idx, int):
-                    all_group_indices.add(idx)
-
-        for idx in sorted(all_group_indices):
-            if idx < 0 or idx >= len(context.rows):
-                continue
-
+        # Apply ONLY to indices_to_update; re-validate against each row's English.
+        for idx in indices_to_update:
             row = context.rows[idx]
-
-            # Preserve your existing “skip structural warnings” behavior
             if "Structure validation warning" in (row.suggestion_reason or ""):
                 continue
-
-            # Don’t stomp row-level error flags/suggestions (copy-check, errors, etc.)
-            if (row.suggested_translation or "").strip():
-                continue
-
+            ok, _ = validate_translation_structure(row.english_text or "", canonical_to_apply)
+            if not ok:
+                continue  # never overwrite with a structure-breaking canonical
             if apply_to_new_translations:
                 if not row.was_newly_translated:
                     continue
                 row.new_translation = canonical_to_apply
             else:
-                # Original behavior: write as a suggestion only
                 if (row.suggested_translation or "").strip():
                     continue
                 row.suggested_translation = canonical_to_apply
-                base_reason = (
-                    f"LLM consistency suggestion: The concept '{english_phrase}' "
-                    f"appears with multiple translations. "
-                    f"Suggested canonical: '{canonical_to_apply}'."
+                row.suggestion_reason = (
+                    f"LLM consistency suggestion: '{english_phrase}' appears with multiple "
+                    f"translations. Suggested canonical: '{canonical_to_apply}'."
+                    + (f" Note: {notes}" if notes else "")
                 )
-                row.suggestion_reason = base_reason + (f" Note: {notes}" if notes else "")
-
-                # Auto-apply to freshly translated rows for output consistency
                 if row.new_translation and not row.had_real_translation:
                     row.new_translation = canonical_to_apply
 
@@ -3673,6 +3840,11 @@ def write_output_file(
         # Remove suggestion columns entirely when suggestions are disabled.
         df_out = df_out.drop(columns=["suggested_translation", "suggestion_reason"], errors="ignore")
 
+    # qa_status is always emitted (read-only advisory, independent of suggestions mode).
+    # Appended last so the first 3 input columns stay intact for Forsta re-import.
+    if "qa_status" not in df_out.columns:
+        df_out["qa_status"] = ""
+
     for i, row in enumerate(context.rows):
         # Column 2: translation (existing or new)
         final_translation = (
@@ -3688,6 +3860,9 @@ def write_output_file(
                 df_out.at[i, "suggested_translation"] = row.suggested_translation
             if row.suggestion_reason:
                 df_out.at[i, "suggestion_reason"] = row.suggestion_reason
+
+        # Always populate qa_status (may be "" for clean rows)
+        df_out.at[i, "qa_status"] = row.qa_status or ""
 
     # Determine if there are any suggestions or warnings (either column)
     if include_suggestions and "suggested_translation" in df_out.columns and "suggestion_reason" in df_out.columns:
@@ -3933,6 +4108,10 @@ to:
         # Create a new event loop for this run
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
+        # Null the cached async client so it binds to THIS loop, not a prior run's loop.
+        reset_async_client()
+        # Clear the per-run translation dedup cache (Step 11).
+        reset_translation_cache()
 
         st.session_state["processed_results"] = []
 
@@ -4145,6 +4324,14 @@ to:
                     except Exception as _cp_err:
                         st.warning(f"Consistency pass skipped for {file.name} due to an error: {_cp_err}")
 
+                    # Re-assert option punctuation after consistency may have rewritten rows.
+                    strip_question_punctuation_from_options(context)
+                    if context.is_same_language_localization:
+                        preserve_source_punctuation(context)
+
+                # Always-on structural audit of every shipped row (read-only, non-destructive).
+                audit_shipped_rows(context)
+
                 out_df, out_filename, excel_bytes = write_output_file(
                     context, original_df, include_suggestions=provide_suggestions
                 )
@@ -4167,6 +4354,7 @@ to:
                     or "translation likely failed" in (r.suggestion_reason or "")
                     or "STRUCTURE FLAG" in (r.suggestion_reason or "")
                     or "Structure validation warning" in (r.suggestion_reason or "")
+                    or "[TRANSLATION FAILED" in (r.new_translation or "")
                 )
 
                 result = {
@@ -4206,6 +4394,11 @@ to:
                 fname = getattr(cfg.get('file'), 'name', str(cfg.get('file', '?')))
                 st.error(f"Failed to process {fname}: {_file_err}")
                 continue
+
+        # All files processed; close the event loop and release the client so
+        # a subsequent run in the same Streamlit session starts clean.
+        loop.close()
+        reset_async_client()
 
     # After possible run, render download buttons from cached results
     processed_results: List[Dict[str, object]] = st.session_state.get("processed_results", [])
