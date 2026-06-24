@@ -86,8 +86,16 @@ DEFAULT_GLOBAL_CONTEXT = (
     "(questions, answer options, scale labels, messages)."
 )
 
-TRANSLATION_MODEL_NAME = os.getenv("TRANSLATION_MODEL", "gpt-5-mini")
-CONSISTENCY_MODEL_NAME = os.getenv("CONSISTENCY_MODEL", "gpt-5-mini")
+# Single source of truth for the model used everywhere (translation, style
+# inference, consistency, back-translation, judge). Latest GA model mid-2026.
+MODEL_NAME = os.getenv("OPENAI_MODEL", "gpt-5.5")
+
+# LLM judge (critique-and-revise) — opt-in quality loop.
+# ENABLE_JUDGE_DEFAULT: UI checkbox default (False = off). Override via the checkbox.
+# JUDGE_SCORE_THRESHOLD: judge scores below this (1-5 scale) trigger one retry.
+#   Default 3 means scores 1-2 → retry; scores 3-5 → ship as-is.
+ENABLE_JUDGE_DEFAULT: bool = False
+JUDGE_SCORE_THRESHOLD: int = int(os.getenv("JUDGE_SCORE_THRESHOLD", "3"))
 
 # Token cap passed to every create() call.  Prevents finish_reason='length'
 # silent truncations.  GPT-5/o-series uses max_completion_tokens; older models
@@ -832,6 +840,16 @@ class SurveyRow:
     # Read-only structural audit of the FINAL shipped value (set by audit_shipped_rows).
     # Never gates output — advisory column only.
     qa_status: Optional[str] = None
+
+    # --- LLM judge state (set only when enable_judge=True; advisory, never gates) ---
+    # judge_score: last score returned by judge_translation_async (T2 if retried, else T1)
+    # judge_reason: specific reason sentence from the judge's last evaluation
+    # judge_retried: True if a critique-and-revise retry (T2) was attempted
+    # judge_outcome: "clean" | "retried_passed" | "retried_flagged" | None (judge did not run)
+    judge_score: Optional[int] = None
+    judge_reason: Optional[str] = None
+    judge_retried: bool = False
+    judge_outcome: Optional[str] = None
 
 @dataclass
 class QuestionBlock:
@@ -1844,7 +1862,7 @@ async def _call_translation_model_async_uncached(
         peer_english_options: Optional[List[str]] = None,
         parent_context: str = "",
         gender_inclusive: bool = False,
-        model_name: str = TRANSLATION_MODEL_NAME,
+        model_name: str = MODEL_NAME,
         answer_option_count: int = 0,
         answer_option_avg_len: float = 0.0,
         is_same_language_localization: bool = False,
@@ -2300,7 +2318,7 @@ async def call_translation_model_async(
         peer_english_options: Optional[List[str]] = None,
         parent_context: str = "",
         gender_inclusive: bool = False,
-        model_name: str = TRANSLATION_MODEL_NAME,
+        model_name: str = MODEL_NAME,
         answer_option_count: int = 0,
         answer_option_avg_len: float = 0.0,
         is_same_language_localization: bool = False,
@@ -2374,7 +2392,7 @@ async def translate_scale_batch_async(
     semaphore: asyncio.Semaphore,
     provide_suggestions: bool,
     gender_inclusive: bool = False,
-    model_name: str = TRANSLATION_MODEL_NAME,
+    model_name: str = MODEL_NAME,
     translated_question_context: str = "",
     concept_term_english: Optional[str] = None,
 ) -> int:
@@ -2746,7 +2764,7 @@ async def infer_style_for_block_async(
     block: QuestionBlock,
     global_context: str,
     semaphore: asyncio.Semaphore,
-    model_name: str = TRANSLATION_MODEL_NAME,
+    model_name: str = MODEL_NAME,
 ) -> BlockStyle:
     """Async version of infer_style_for_block."""
     async with semaphore:
@@ -2890,7 +2908,7 @@ async def infer_block_styles_async(
     context: SurveyFileContext,
     global_context: str,
     semaphore: asyncio.Semaphore,
-    model_name: str = TRANSLATION_MODEL_NAME,
+    model_name: str = MODEL_NAME,
 ) -> Dict[int, BlockStyle]:
     """Async version of infer_block_styles. Fires all block inferences concurrently."""
     block_styles: Dict[int, BlockStyle] = {}
@@ -2924,7 +2942,7 @@ def call_consistency_model(
     context: SurveyFileContext,
     phrase_groups: List[Dict[str, object]],
     global_context: str = "",
-    model_name: str = CONSISTENCY_MODEL_NAME,
+    model_name: str = MODEL_NAME,
 ) -> List[Dict[str, object]]:
     """
     LLM-powered survey-wide consistency checker.
@@ -3706,6 +3724,7 @@ async def process_row_async(
         semaphore: asyncio.Semaphore,
         provide_suggestions: bool,
         gender_inclusive: bool = False,
+        enable_judge: bool = False,
 ) -> SurveyRow:
     if row.batch_translated:
         return row
@@ -3940,6 +3959,89 @@ async def process_row_async(
                 )
                 row.suggestion_reason = result.get("change_reason")
 
+        # --- LLM judge / critique-and-revise loop ---
+        # Runs only when: the judge is enabled, this is a newly-translated row,
+        # the translation is not a failure sentinel, and no API error occurred.
+        if (
+            enable_judge
+            and row.was_newly_translated
+            and (row.new_translation or "").strip()
+            and not (row.new_translation or "").startswith("[TRANSLATION FAILED")
+        ):
+            bs = (
+                context.block_styles.get(row.block_id)
+                if context.block_styles and row.block_id is not None
+                else None
+            )
+            style_note = _format_style_note(bs)
+            t1 = row.new_translation
+
+            # Judge T1
+            j1 = await judge_translation_async(
+                eng_text, t1, context.language_code, style_note
+            )
+
+            if j1.get("error") or j1.get("score") is None:
+                # Non-fatal: keep T1, no flag
+                pass
+            elif j1["score"] >= JUDGE_SCORE_THRESHOLD:
+                # T1 passes — record and ship
+                row.judge_score = j1["score"]
+                row.judge_reason = j1.get("reason")
+                row.judge_outcome = "clean"
+            else:
+                # T1 below threshold: one critique-and-revise retry
+                retry_ctx = (
+                    global_context
+                    + f"\n\nPrevious attempt had this issue: {j1.get('reason', '')}. "
+                    "Please retranslate addressing this specific concern."
+                )
+                r2 = await call_translation_model_async(
+                    english_text=eng_text,
+                    language_code=context.language_code,
+                    locale_code=context.locale_code,
+                    global_context=retry_ctx,
+                    translation_memory=context.translation_memory,
+                    existing_translation=None,
+                    segment_type=row.segment_type,
+                    block_style=bs,
+                    peer_english_options=peer_english_options,
+                    parent_context=parent_context_str,
+                    gender_inclusive=gender_inclusive,
+                    answer_option_count=ao_count,
+                    answer_option_avg_len=ao_avg_len,
+                    is_same_language_localization=context.is_same_language_localization,
+                )
+                t2 = pick_final_translation(r2, english_text=eng_text)
+
+                if t2.strip() and not r2.get("error"):
+                    # Validate and apply T2
+                    ok2, _ = validate_translation_structure(eng_text, t2)
+                    if ok2:
+                        row.new_translation = adjust_capitalization_for_label(
+                            eng_text, t2, context.language_code, ao_count, ao_avg_len
+                        )
+                    # else: validation failed on T2 — still adopt it (already flagged by
+                    # the existing structure-validation path upstream); don't revert to T1
+
+                row.judge_retried = True
+
+                # Judge T2 exactly once — no further retry regardless of score
+                j2 = await judge_translation_async(
+                    eng_text, row.new_translation, context.language_code, style_note
+                )
+                if not j2.get("error") and j2.get("score") is not None:
+                    row.judge_score = j2["score"]
+                    row.judge_reason = j2.get("reason")
+                    if j2["score"] >= JUDGE_SCORE_THRESHOLD:
+                        row.judge_outcome = "retried_passed"
+                    else:
+                        row.judge_outcome = "retried_flagged"
+                        row.qa_status = (
+                            (row.qa_status + " | ") if row.qa_status else ""
+                        ) + f"JUDGE: low score {j2['score']} after retry — human review."
+                # else: non-fatal judge failure on T2; ship T2 without a flag
+
         return row
 
 
@@ -4132,7 +4234,7 @@ async def call_backtranslation_model_async(
     target_text: str,
     target_language_code: str,
     semaphore: asyncio.Semaphore,
-    model_name: str = TRANSLATION_MODEL_NAME,
+    model_name: str = MODEL_NAME,
 ) -> dict:
     """
     Back-translate *target_text* (in *target_language_code*) into literal English,
@@ -4186,6 +4288,101 @@ async def call_backtranslation_model_async(
             await asyncio.sleep(2 ** attempt)
 
     return {"english": "", "error": True, "change_reason": last_error}
+
+
+async def judge_translation_async(
+    english_text: str,
+    translation: str,
+    language_code: str,
+    style_note: str = "",
+    model_name: str = MODEL_NAME,
+) -> dict:
+    """
+    LLM judge for the critique-and-revise quality loop (Step 2 in the plan).
+
+    Asks the model to score *translation* on a 1-5 naturalness/register scale
+    and return a specific reason sentence.
+
+    Returns {"score": int, "reason": str} on success, or
+            {"score": None, "reason": "", "error": True} on terminal failure.
+
+    Runs under the *caller's* semaphore slot (no acquire here) — same pattern as
+    the copy-check retry in process_row_async.  Language-agnostic: only the
+    language label and an optional free-text style_note enter the prompt.
+    Non-fatal: any API error or malformed JSON returns {"error": True}.
+    """
+    lang = code_to_language_label(language_code) or language_code
+
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                f"You are a survey-localization QA reviewer for {lang}. "
+                f"Judge whether the translation reads as natural survey copy in {lang} "
+                f"and whether its register is consistent with the style log provided. "
+                f"Score 1 (very poor) to 5 (excellent). "
+                f'Return ONLY valid JSON: {{"score": <integer 1-5>, "reason": "<one specific sentence explaining the score>"}}'
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                f"English source: {english_text}\n"
+                f"Translation ({lang}): {translation}\n"
+                f"Style log: {style_note or 'none'}"
+            ),
+        },
+    ]
+
+    last_error: Optional[str] = None
+    for attempt in range(3):
+        try:
+            client = get_async_client()
+            response = await client.chat.completions.create(
+                model=model_name,
+                messages=messages,
+                response_format={"type": "json_object"},
+                max_completion_tokens=MAX_COMPLETION_TOKENS,
+                temperature=0,
+                seed=TRANSLATION_SEED,
+            )
+            _record_fingerprint(response)
+            parsed = _safe_json(response)
+            if isinstance(parsed, dict) and "score" in parsed:
+                try:
+                    score = int(parsed["score"])
+                except (TypeError, ValueError):
+                    last_error = f"Non-integer score in judge response: {parsed}"
+                    continue
+                if not (1 <= score <= 5):
+                    last_error = f"Judge score out of range: {score}"
+                    continue
+                return {"score": score, "reason": str(parsed.get("reason") or "")}
+            last_error = f"Missing 'score' key in judge response: {parsed}"
+        except _RetryableModelError as exc:
+            last_error = str(exc)
+            await asyncio.sleep(2 ** attempt)
+        except Exception as exc:
+            last_error = str(exc)
+            await asyncio.sleep(2 ** attempt)
+
+    return {"score": None, "reason": "", "error": True, "change_reason": last_error}
+
+
+def _format_style_note(block_style: Optional["BlockStyle"]) -> str:
+    """Summarise a BlockStyle into a short English sentence for the judge prompt."""
+    if not block_style:
+        return ""
+    parts = []
+    if block_style.options_grammatical_person and block_style.options_grammatical_person != "unspecified":
+        parts.append(f"person: {block_style.options_grammatical_person}")
+    if block_style.options_phrase_form and block_style.options_phrase_form != "unspecified":
+        parts.append(f"phrase form: {block_style.options_phrase_form}")
+    if block_style.options_tone and block_style.options_tone != "formal_neutral":
+        parts.append(f"tone: {block_style.options_tone}")
+    if block_style.notes:
+        parts.append(block_style.notes)
+    return "; ".join(parts)
 
 
 async def semantic_verification_pass(
@@ -4527,6 +4724,11 @@ def write_output_file(
     if "qa_status" not in df_out.columns:
         df_out["qa_status"] = ""
 
+    # judge_status: always emitted when the judge ran for at least one row;
+    # harmless empty string when judge was disabled.
+    if "judge_status" not in df_out.columns:
+        df_out["judge_status"] = ""
+
     for i, row in enumerate(context.rows):
         # Column 2: translation (existing or new)
         final_translation = (
@@ -4545,6 +4747,16 @@ def write_output_file(
 
         # Always populate qa_status (may be "" for clean rows)
         df_out.at[i, "qa_status"] = row.qa_status or ""
+
+        # Populate judge_status when the judge produced an outcome.
+        # "retried_flagged" rows are the human-review priority queue.
+        if row.judge_outcome:
+            score_note = (
+                f" (score {row.judge_score}: {row.judge_reason})"
+                if row.judge_score is not None
+                else ""
+            )
+            df_out.at[i, "judge_status"] = row.judge_outcome + score_note
 
     # Determine if there are any suggestions or warnings (either column)
     if include_suggestions and "suggested_translation" in df_out.columns and "suggestion_reason" in df_out.columns:
@@ -4716,6 +4928,17 @@ to:
             "'suggested_translation' / 'suggestion_reason'. When disabled, existing "
             "translations are not QA'd, but the survey-level consistency pass still "
             "runs to harmonize translations generated in this run."
+        ),
+    )
+
+    enable_judge = st.checkbox(
+        "Enable LLM judge (critique-and-revise quality loop)",
+        value=ENABLE_JUDGE_DEFAULT,
+        help=(
+            "After each new translation, an LLM judge (1–5 scale) scores naturalness "
+            f"and register. Scores below {JUDGE_SCORE_THRESHOLD} trigger one retranslation "
+            "using the judge's specific feedback. Rows that still score low after retry "
+            "are marked in the judge_status column for human review. Off by default."
         ),
     )
 
@@ -4997,7 +5220,7 @@ to:
 
                     # Create tasks (batch-translated rows will return immediately)
                     for row in context.rows:
-                        tasks.append(process_row_async(row, context, global_context, semaphore, provide_suggestions, gender_inclusive=gender_inclusive))
+                        tasks.append(process_row_async(row, context, global_context, semaphore, provide_suggestions, gender_inclusive=gender_inclusive, enable_judge=enable_judge))
 
                     # Run tasks and update UI incrementally
                     completed_count = 0
@@ -5113,6 +5336,9 @@ to:
                     or "Structure validation warning" in (r.suggestion_reason or "")
                     or "[TRANSLATION FAILED" in (r.new_translation or "")
                 )
+                # Judge stats: only meaningful when enable_judge was True.
+                n_judge_retried = sum(1 for r in context.rows if r.judge_retried)
+                n_judge_flagged = sum(1 for r in context.rows if r.judge_outcome == "retried_flagged")
 
                 result = {
                     "file_name": file.name,
@@ -5121,6 +5347,8 @@ to:
                     "num_new_translations": n_new,
                     "num_suggestions": n_sugg,
                     "num_error_rows": n_err,
+                    "num_judge_retried": n_judge_retried,
+                    "num_judge_flagged": n_judge_flagged,
                     "is_same_language_localization": context.is_same_language_localization,
                 }
 
@@ -5182,11 +5410,22 @@ to:
                 "Rows localized" if res.get("is_same_language_localization")
                 else "New translations (former English placeholders)"
             )
+            judge_note = ""
+            if res.get("num_judge_retried"):
+                judge_note = (
+                    f" | Judge retried: {res['num_judge_retried']}"
+                    + (
+                        f" (still flagged: {res['num_judge_flagged']} — see judge_status column)"
+                        if res.get("num_judge_flagged")
+                        else " (all passed)"
+                    )
+                )
             st.success(
                 f"Finished processing `{res['file_name']}`. "
                 f"{new_label}: {res['num_new_translations']} | "
                 f"Rows with suggestions/warnings: {res['num_suggestions']} | "
                 f"Rows needing review (errors/structure flags): {res['num_error_rows']}"
+                + judge_note
             )
 
             st.download_button(
