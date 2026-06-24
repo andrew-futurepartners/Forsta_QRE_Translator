@@ -108,6 +108,11 @@ MAX_COMPLETION_TOKENS = int(os.getenv("MAX_COMPLETION_TOKENS", "4096"))
 _seed_raw = os.getenv("TRANSLATION_SEED", "1234")
 TRANSLATION_SEED: Optional[int] = int(_seed_raw) if _seed_raw.strip() else None
 
+# Column B (the source text) in every file processed by this tool is always English.
+# Same-language dialect adaptation therefore only applies when the TARGET language is
+# also English (e.g. en -> en-GB).  Any non-English target is a full translation.
+SOURCE_LANGUAGE_BASE: str = "en"
+
 # Collected per run; surfaced in the UI so output provenance is reviewable.
 _SYSTEM_FINGERPRINTS: set = set()
 
@@ -137,6 +142,8 @@ LANGUAGE_NAME_TO_CODE = {
     "italian": "it",
     "japanese": "ja",
     "chinese": "zh",
+    "simplifiedchinese": "zh",
+    "traditionalchinese": "zh",
     "dutch": "nl",
     "korean": "ko",
     "hindi": "hi",
@@ -188,6 +195,14 @@ ENGLISH_LOCALE_NAME_TO_BCP47 = {
     "en": "en",
 }
 
+PORTUGUESE_LOCALE_NAME_TO_BCP47 = {
+    "br": "pt-BR",
+    "brazil": "pt-BR",
+    "brasil": "pt-BR",
+    "portugal": "pt-PT",
+    "pt": "pt-PT",
+}
+
 # Shorthand tokens that imply English + a specific locale when they appear
 # as the language segment in the filename (e.g., 260306_uk.xls).
 _ENGLISH_LOCALE_SHORTHANDS = {
@@ -209,48 +224,41 @@ LOCALE_OPTIONS = {
         ("Australia (en-AU)", "en-AU"),
     ],
     "es": [
-        ("Generic Spanish (no specific country)", "es"),
-        ("Mexico (es-MX)", "es-MX"),
-        ("United States / US Hispanic (es-US)", "es-US"),
         ("Spain (es-ES)", "es-ES"),
+        ("Mexico (es-MX)", "es-MX"),
         ("Argentina (es-AR)", "es-AR"),
         ("Colombia (es-CO)", "es-CO"),
         ("Chile (es-CL)", "es-CL"),
         ("Peru (es-PE)", "es-PE"),
+        ("United States / US Hispanic (es-US)", "es-US"),
     ],
     "fr": [
-        ("Generic French (no specific country)", "fr"),
         ("France (fr-FR)", "fr-FR"),
         ("Canada (fr-CA)", "fr-CA"),
         ("Belgium (fr-BE)", "fr-BE"),
         ("Switzerland (fr-CH)", "fr-CH"),
     ],
     "pt": [
-        ("Generic Portuguese (no specific country)", "pt"),
-        ("Brazil (pt-BR)", "pt-BR"),
         ("Portugal (pt-PT)", "pt-PT"),
+        ("Brazil (pt-BR)", "pt-BR"),
     ],
     "de": [
-        ("Generic German (no specific country)", "de"),
         ("Germany (de-DE)", "de-DE"),
         ("Austria (de-AT)", "de-AT"),
         ("Switzerland (de-CH)", "de-CH"),
     ],
     "it": [
-        ("Generic Italian (no specific country)", "it"),
         ("Italy (it-IT)", "it-IT"),
     ],
     "ja": [
         ("Japan (ja-JP)", "ja-JP"),
     ],
     "zh": [
-        ("Generic Chinese (unspecified script)", "zh"),
         ("Chinese (Simplified, zh-CN)", "zh-CN"),
         ("Chinese (Traditional, zh-TW)", "zh-TW"),
         ("Chinese (Hong Kong, zh-HK)", "zh-HK"),
     ],
     "nl": [
-        ("Generic Dutch (no specific country)", "nl"),
         ("Netherlands (nl-NL)", "nl-NL"),
         ("Belgium / Flemish (nl-BE)", "nl-BE"),
     ],
@@ -258,7 +266,6 @@ LOCALE_OPTIONS = {
         ("South Korea (ko-KR)", "ko-KR"),
     ],
     "hi": [
-        ("Generic Hindi (no specific country)", "hi"),
         ("India (hi-IN)", "hi-IN"),
     ],
 }
@@ -510,8 +517,8 @@ def _apply_fr_number_format(context: "SurveyFileContext") -> int:
     fixed = 0
     for row in context.rows:
         trl = row.new_translation or ""
-        new_trl = _FR_PCT_RE.sub(r'\1\u00a0%', trl)          # non-breaking space
-        new_trl = _FR_RANGE_RE.sub(r'\1\u2013\2', new_trl)   # en-dash
+        new_trl = _FR_PCT_RE.sub('\\1\u00a0%', trl)          # non-breaking space
+        new_trl = _FR_RANGE_RE.sub('\\1\u2013\\2', new_trl)   # en-dash
         if new_trl != trl:
             row.new_translation = new_trl
             fixed += 1
@@ -655,34 +662,198 @@ _GENDERED_LANGUAGE_CONFIG = {
 # Single source of truth for per-language feature flags.
 # Keys are BCP-47 base codes (before the first "-").
 # Fields:
-#   first_person  - bool: reliable first-person detection/restyle supported
-#   gender_marker - "marker" | "agreement" | "none"
-#   has_articles  - bool: language uses definite articles on nouns (list-context gate)
-#   cjk           - bool: CJK script (brand-name reading aids; skip capitalization adjust)
-#   has_case      - bool: morphological case (informational, for future use)
-#   dialect_codes - List[str]: recognized same-language dialect locales (for Step 21)
+#   first_person               - bool: reliable first-person detection/restyle supported
+#   gender_marker              - "marker" | "agreement" | "none"
+#   has_articles               - bool: language uses definite articles on nouns (list-context gate)
+#   cjk                        - bool: CJK script (brand-name reading aids; skip capitalization adjust)
+#   has_case                   - bool: morphological case (informational, for future use)
+#   dialect_codes              - List[str]: recognized same-language dialect locales (for Step 21)
+#   default_instruction_register - str | None: ready-to-use English phrase injected into
+#                                  INSTRUCTION-row prompts; None for languages without a
+#                                  formal/informal distinction relevant to survey copy.
 LANGUAGE_CAPABILITIES: Dict[str, Dict[str, object]] = {
-    "en": {"first_person": True,  "gender_marker": "none",      "has_articles": True,  "cjk": False, "has_case": False, "dialect_codes": ["en-GB", "en-AU", "en-CA", "en-NZ", "en-IE", "en-ZA"]},
-    "es": {"first_person": True,  "gender_marker": "marker",    "has_articles": True,  "cjk": False, "has_case": False, "dialect_codes": ["es-MX", "es-AR", "es-CO", "es-CL", "es-PE", "es-419", "es-US"]},
-    "fr": {"first_person": True,  "gender_marker": "marker",    "has_articles": True,  "cjk": False, "has_case": False, "dialect_codes": ["fr-CA", "fr-BE", "fr-CH"]},
-    "pt": {"first_person": True,  "gender_marker": "marker",    "has_articles": True,  "cjk": False, "has_case": False, "dialect_codes": ["pt-BR", "pt-AO", "pt-MZ"]},
-    "de": {"first_person": True,  "gender_marker": "marker",    "has_articles": True,  "cjk": False, "has_case": True,  "dialect_codes": ["de-AT", "de-CH"]},
-    "it": {"first_person": True,  "gender_marker": "marker",    "has_articles": True,  "cjk": False, "has_case": False, "dialect_codes": []},
-    "nl": {"first_person": False, "gender_marker": "none",      "has_articles": True,  "cjk": False, "has_case": False, "dialect_codes": ["nl-BE"]},
-    "ja": {"first_person": False, "gender_marker": "none",      "has_articles": False, "cjk": True,  "has_case": True,  "dialect_codes": []},
-    "ko": {"first_person": False, "gender_marker": "none",      "has_articles": False, "cjk": True,  "has_case": True,  "dialect_codes": []},
-    "zh": {"first_person": False, "gender_marker": "none",      "has_articles": False, "cjk": True,  "has_case": False, "dialect_codes": ["zh-TW", "zh-HK", "zh-SG"]},
-    "hi": {"first_person": False, "gender_marker": "agreement", "has_articles": False, "cjk": False, "has_case": True,  "dialect_codes": []},
-    "ar": {"first_person": False, "gender_marker": "agreement", "has_articles": True,  "cjk": False, "has_case": True,  "dialect_codes": []},
-    "ru": {"first_person": False, "gender_marker": "agreement", "has_articles": False, "cjk": False, "has_case": True,  "dialect_codes": []},
-    "pl": {"first_person": False, "gender_marker": "agreement", "has_articles": False, "cjk": False, "has_case": True,  "dialect_codes": []},
-    "tr": {"first_person": False, "gender_marker": "none",      "has_articles": False, "cjk": False, "has_case": True,  "dialect_codes": []},
+    "en": {"first_person": True,  "gender_marker": "none",      "has_articles": True,  "cjk": False, "has_case": False, "dialect_codes": ["en-GB", "en-AU", "en-CA", "en-NZ", "en-IE", "en-ZA"], "default_instruction_register": None},
+    "es": {"first_person": True,  "gender_marker": "marker",    "has_articles": True,  "cjk": False, "has_case": False, "dialect_codes": ["es-MX", "es-AR", "es-CO", "es-CL", "es-PE", "es-419", "es-US"], "default_instruction_register": "the formal usted register"},
+    "fr": {"first_person": True,  "gender_marker": "marker",    "has_articles": True,  "cjk": False, "has_case": False, "dialect_codes": ["fr-CA", "fr-BE", "fr-CH"], "default_instruction_register": "the formal vous register"},
+    "pt": {"first_person": True,  "gender_marker": "marker",    "has_articles": True,  "cjk": False, "has_case": False, "dialect_codes": ["pt-BR", "pt-AO", "pt-MZ"], "default_instruction_register": "the formal você/o senhor register"},
+    "de": {"first_person": True,  "gender_marker": "marker",    "has_articles": True,  "cjk": False, "has_case": True,  "dialect_codes": ["de-AT", "de-CH"], "default_instruction_register": "the formal Sie register"},
+    "it": {"first_person": True,  "gender_marker": "marker",    "has_articles": True,  "cjk": False, "has_case": False, "dialect_codes": [], "default_instruction_register": "the formal Lei register"},
+    "nl": {"first_person": False, "gender_marker": "none",      "has_articles": True,  "cjk": False, "has_case": False, "dialect_codes": ["nl-BE"], "default_instruction_register": None},
+    "ja": {"first_person": False, "gender_marker": "none",      "has_articles": False, "cjk": True,  "has_case": True,  "dialect_codes": [], "default_instruction_register": None},
+    "ko": {"first_person": False, "gender_marker": "none",      "has_articles": False, "cjk": True,  "has_case": True,  "dialect_codes": [], "default_instruction_register": None},
+    "zh": {"first_person": False, "gender_marker": "none",      "has_articles": False, "cjk": True,  "has_case": False, "dialect_codes": ["zh-TW", "zh-HK", "zh-SG"], "default_instruction_register": None},
+    "hi": {"first_person": False, "gender_marker": "agreement", "has_articles": False, "cjk": False, "has_case": True,  "dialect_codes": [], "default_instruction_register": None},
+    "ar": {"first_person": False, "gender_marker": "agreement", "has_articles": True,  "cjk": False, "has_case": True,  "dialect_codes": [], "default_instruction_register": None},
+    "ru": {"first_person": False, "gender_marker": "agreement", "has_articles": False, "cjk": False, "has_case": True,  "dialect_codes": [], "default_instruction_register": None},
+    "pl": {"first_person": False, "gender_marker": "agreement", "has_articles": False, "cjk": False, "has_case": True,  "dialect_codes": [], "default_instruction_register": None},
+    "tr": {"first_person": False, "gender_marker": "none",      "has_articles": False, "cjk": False, "has_case": True,  "dialect_codes": [], "default_instruction_register": None},
 }
 
 _LC_FALLBACK: Dict[str, object] = {
     "first_person": False, "gender_marker": "none", "has_articles": False,
     "cjk": False, "has_case": False, "dialect_codes": [],
+    "default_instruction_register": None,
 }
+
+
+# ── Fix 2: Known-phrase map for standardized survey comment strings ────────────
+# Keys are lowercase, stripped, trailing-period-removed English phrases.
+# Templated keys contain {n} for a captured integer (e.g. "select up to {n}").
+# This dict is the ONLY place these approved translations live — no per-language
+# logic appears in the lookup code below.
+KNOWN_SURVEY_PHRASES: Dict[str, Dict[str, str]] = {
+    "select one": {
+        "es": "Seleccione una opción.",
+        "fr": "Sélectionnez une option.",
+        "de": "Wählen Sie eine Option.",
+        "it": "Selezionare un'opzione.",
+        "pt": "Selecione uma opção.",
+        "nl": "Selecteer één optie.",
+        "ja": "1つ選択してください。",
+        "ko": "하나를 선택해 주세요.",
+        "zh": "请选择一项。",
+        "ar": "اختر خياراً واحداً.",
+        "ru": "Выберите один вариант.",
+        "pl": "Wybierz jedną opcję.",
+        "tr": "Bir seçenek seçin.",
+    },
+    "select all that apply": {
+        "es": "Seleccione todas las opciones que correspondan.",
+        "fr": "Sélectionnez toutes les options qui s'appliquent.",
+        "de": "Wählen Sie alle zutreffenden Optionen.",
+        "it": "Selezionare tutte le opzioni applicabili.",
+        "pt": "Selecione todas as opções que se aplicam.",
+        "nl": "Selecteer alle opties die van toepassing zijn.",
+        "ja": "該当するものをすべて選択してください。",
+        "ko": "해당하는 모든 항목을 선택해 주세요.",
+        "zh": "请选择所有适用的选项。",
+        "ar": "اختر كل ما ينطبق.",
+        "ru": "Выберите все подходящие варианты.",
+        "pl": "Wybierz wszystkie pasujące opcje.",
+        "tr": "Uygun olan tüm seçenekleri işaretleyin.",
+    },
+    "check all that apply": {
+        "es": "Seleccione todas las opciones que correspondan.",
+        "fr": "Cochez toutes les options qui s'appliquent.",
+        "de": "Markieren Sie alle zutreffenden Optionen.",
+        "it": "Spuntare tutte le opzioni applicabili.",
+        "pt": "Marque todas as opções que se aplicam.",
+        "nl": "Vink alle opties aan die van toepassing zijn.",
+        "ja": "該当するものをすべてチェックしてください。",
+        "ko": "해당하는 모든 항목에 체크해 주세요.",
+        "zh": "请勾选所有适用的选项。",
+        "ar": "حدد كل ما ينطبق.",
+        "ru": "Отметьте все подходящие варианты.",
+        "pl": "Zaznacz wszystkie pasujące opcje.",
+        "tr": "Geçerli olan tüm seçenekleri işaretleyin.",
+    },
+    # Templated entries — key contains {n}, value contains {n} for substitution.
+    "select up to {n}": {
+        "es": "Seleccione hasta {n}.",
+        "fr": "Sélectionnez jusqu'à {n}.",
+        "de": "Wählen Sie bis zu {n} Optionen.",
+        "it": "Selezionare fino a {n}.",
+        "pt": "Selecione até {n}.",
+        "nl": "Selecteer maximaal {n} opties.",
+        "ja": "最大{n}つ選択してください。",
+        "ko": "최대 {n}개를 선택해 주세요.",
+        "zh": "最多选择{n}项。",
+        "ar": "اختر ما يصل إلى {n}.",
+        "ru": "Выберите не более {n} вариантов.",
+        "pl": "Wybierz do {n} opcji.",
+        "tr": "En fazla {n} seçenek seçin.",
+    },
+    "choose up to {n}": {
+        "es": "Seleccione hasta {n}.",
+        "fr": "Choisissez jusqu'à {n}.",
+        "de": "Wählen Sie bis zu {n} Optionen.",
+        "it": "Scegliete fino a {n}.",
+        "pt": "Escolha até {n}.",
+        "nl": "Kies maximaal {n} opties.",
+        "ja": "最大{n}つ選んでください。",
+        "ko": "최대 {n}개를 선택해 주세요.",
+        "zh": "最多选择{n}项。",
+        "ar": "اختر ما يصل إلى {n}.",
+        "ru": "Выберите до {n} вариантов.",
+        "pl": "Wybierz do {n} opcji.",
+        "tr": "En fazla {n} seçenek seçin.",
+    },
+    "select at least {n}": {
+        "es": "Seleccione al menos {n}.",
+        "fr": "Sélectionnez au moins {n}.",
+        "de": "Wählen Sie mindestens {n} Optionen.",
+        "it": "Selezionare almeno {n}.",
+        "pt": "Selecione pelo menos {n}.",
+        "nl": "Selecteer minimaal {n} opties.",
+        "ja": "少なくとも{n}つ選択してください。",
+        "ko": "최소 {n}개를 선택해 주세요.",
+        "zh": "至少选择{n}项。",
+        "ar": "اختر ما لا يقل عن {n}.",
+        "ru": "Выберите не менее {n} вариантов.",
+        "pl": "Wybierz co najmniej {n} opcji.",
+        "tr": "En az {n} seçenek seçin.",
+    },
+}
+
+# Pre-compiled regex for each templated key: (compiled_pattern, template_key)
+# Pattern captures the integer so it can be substituted into the target-language value.
+_KNOWN_PHRASE_TEMPLATE_RE: List[tuple] = []
+
+
+def _build_known_phrase_template_res() -> None:
+    """Compile regexes for templated KNOWN_SURVEY_PHRASES keys at import time."""
+    for key in KNOWN_SURVEY_PHRASES:
+        if "{n}" in key:
+            pattern_str = re.escape(key).replace(r"\{n\}", r"(\d+)")
+            _KNOWN_PHRASE_TEMPLATE_RE.append((re.compile(pattern_str, re.IGNORECASE), key))
+
+
+_build_known_phrase_template_res()
+
+
+def lookup_known_survey_phrase(english_text: str, language_code: str) -> Optional[str]:
+    """
+    Return the approved translation for a standardized survey comment string, or None.
+
+    Normalizes the English input (strip HTML tags, lowercase, strip whitespace and
+    trailing punctuation) before matching, so variations in casing and trailing
+    periods are handled transparently.
+
+    For templated keys (e.g. "select up to {n}"), captures the integer from the
+    English text and substitutes it into the target-language template.
+
+    Returns None when:
+    - the phrase is not in the map, or
+    - the map has no entry for the base language code.
+    """
+    if not english_text:
+        return None
+
+    # Strip HTML tags, collapse whitespace, lowercase, remove trailing punctuation.
+    normalized = re.sub(r"<[^>]+>", " ", english_text)
+    normalized = " ".join(normalized.split()).lower().rstrip(".,;:")
+
+    lang_base = (language_code or "").lower().split("-")[0]
+
+    # 1. Exact key match.
+    lang_map = KNOWN_SURVEY_PHRASES.get(normalized)
+    if lang_map is not None:
+        return lang_map.get(lang_base)
+
+    # 2. Template key match.
+    for compiled_re, template_key in _KNOWN_PHRASE_TEMPLATE_RE:
+        m = compiled_re.fullmatch(normalized)
+        if m:
+            n_val = m.group(1)
+            lang_map = KNOWN_SURVEY_PHRASES.get(template_key)
+            if lang_map is None:
+                continue
+            tpl = lang_map.get(lang_base)
+            if tpl is None:
+                return None
+            return tpl.replace("{n}", n_val)
+
+    return None
 
 
 def _get_lang_cap(language_code: str) -> Dict[str, object]:
@@ -706,6 +877,30 @@ def build_brand_name_instruction(language_code: str) -> str:
         "Example for Japanese: 'Copilot(コパイロット)', 'Claude(クロード)'. "
         "Do NOT fully transliterate brand names into the target script."
     )
+
+
+def build_instruction_register_instruction(
+    language_code: str,
+    segment_type: Optional[str] = None,
+) -> str:
+    """
+    For languages with a formal/informal T-V distinction, inject the locale-default
+    register into INSTRUCTION-row prompts so all directives use a consistent form.
+
+    segment_type: pass segment_type.name (e.g. "INSTRUCTION") — same convention as
+    build_gender_inclusive_instruction.
+
+    Returns an empty string for non-instruction rows and for languages whose
+    default_instruction_register is None (no distinction relevant to survey copy).
+    The language-specific text lives entirely in LANGUAGE_CAPABILITIES — no
+    per-language logic appears here.
+    """
+    if segment_type != "INSTRUCTION":
+        return ""
+    frag = _get_lang_cap(language_code).get("default_instruction_register")
+    if not frag:
+        return ""
+    return f"REGISTER: Use {frag} for all directives and instructions in this text."
 
 
 def is_article_suppressed_list(
@@ -950,7 +1145,9 @@ def classify_segment_type(english_text: str, variable_name: str = "") -> Segment
     if re.search(
         r"(select one|select all that apply|check all that apply|please select|please choose|"
         r"mark all that apply|pick one|be specific|please specify|please describe|please explain|"
-        r"provide details|give details|enter a number|enter your answer|write in your own words)",
+        r"provide details|give details|enter a number|enter your answer|write in your own words|"
+        r"select up to|choose up to|pick up to|select at least|choose at least|pick at least|"
+        r"select between|choose between)",
         lower,
     ):
         return SegmentType.INSTRUCTION
@@ -1273,6 +1470,8 @@ def map_language_and_locale_to_bcp47(language_code: str, locale_name: Optional[s
         return SPANISH_LOCALE_NAME_TO_BCP47.get(key, language_code)
     if language_code == "en":
         return ENGLISH_LOCALE_NAME_TO_BCP47.get(key, language_code)
+    if language_code == "pt":
+        return PORTUGUESE_LOCALE_NAME_TO_BCP47.get(key, language_code)
 
     # Extra: if filename already contains a BCP-47-like code (e.g. es-MX), just return it
     if re.match(rf"^{language_code}-[A-Za-z]+$", locale_name.strip()):
@@ -1311,6 +1510,17 @@ def parse_language_and_locale_from_filename(filename: str) -> Tuple[str, str]:
     locale_name = parts[2] if len(parts) >= 3 else None
 
     language_code = map_language_name_to_code(language_name)
+
+    # Compound Chinese script tokens: "simplifiedchinese" -> zh / zh-CN,
+    # "traditionalchinese" -> zh / zh-TW.  The script variant is encoded in the
+    # token itself so we resolve the locale directly here rather than waiting for
+    # a third filename part that won't be present.
+    if language_name:
+        _lang_token_lower = language_name.strip().lower()
+        if _lang_token_lower == "simplifiedchinese":
+            return "zh", "zh-CN"
+        if _lang_token_lower == "traditionalchinese":
+            return "zh", "zh-TW"
 
     # Shorthand fallback: if the language token itself is a known English locale
     # abbreviation (e.g., "uk", "aus", "ca"), treat it as English + that locale.
@@ -1694,18 +1904,23 @@ def build_translation_memory(rows: List[SurveyRow]) -> Dict[str, Dict[str, str]]
 
 def _detect_same_language_localization(language_code: str, locale_code: str) -> bool:
     """
-    Return True when the translation job is a same-language dialect adaptation
-    (e.g. en -> en-GB, es -> es-MX, pt -> pt-BR, zh -> zh-TW).
-    Uses LANGUAGE_CAPABILITIES.dialect_codes as the authoritative allowlist.
+    Return True only for a genuine same-language dialect adaptation, i.e. when the
+    TARGET language is the same as the (always-English) source language in Column B.
+
+    Because Column B is always English, same-language mode only applies when the
+    target is also English (e.g. en -> en-GB, en -> en-AU).  Any non-English target
+    (es-MX, fr-CA, pt-BR, zh-TW, etc.) is a full translation from English, never a
+    dialect adaptation, so this function returns False for all of them.
+
+    Uses LANGUAGE_CAPABILITIES.dialect_codes for the English-target allowlist so that
+    generic "en" without a regional qualifier does not accidentally trigger dialect mode.
     """
-    base_lang = (language_code or "").lower().split("-")[0]
-    base_locale = (locale_code or "").lower().split("-")[0]
-    if base_lang != base_locale:
-        return False  # different base languages -> not a same-language localization
-    cap = _get_lang_cap(base_lang)
+    target_base = (language_code or "").lower().split("-")[0]
+    if target_base != SOURCE_LANGUAGE_BASE:
+        return False  # non-English target -> always a full translation from English
+    cap = _get_lang_cap(target_base)
     dialect_codes = cap.get("dialect_codes") or []
-    normalized_locale = (locale_code or "").lower()
-    return normalized_locale in [d.lower() for d in dialect_codes]
+    return (locale_code or "").lower() in [d.lower() for d in dialect_codes]
 
 
 def load_forsta_export(
@@ -1922,6 +2137,11 @@ async def _call_translation_model_async_uncached(
     )
 
     brand_name_instruction = build_brand_name_instruction(language_code)
+
+    instruction_register_instruction = build_instruction_register_instruction(
+        language_code,
+        segment_type=segment_type.name if segment_type is not None else None,
+    )
 
     # Grounding instruction: prevent semantic drift in answer option translations
     grounding_instruction = ""
@@ -2159,6 +2379,8 @@ Segment metadata for this element:
 
 {brand_name_instruction}
 
+{instruction_register_instruction}
+
 {gender_inclusive_instruction}
 
 English source text:
@@ -2178,6 +2400,8 @@ Translation memory examples (English -> target translation):
     - Translate as a clear, polite imperative or directive, as a complete sentence.
       (For example: equivalents of "Select one option", "Select all that apply",
       "Enter a number", "Please describe".)
+    - If a REGISTER line appears above, apply that register to all imperative verbs
+      in this instruction (e.g. use usted/vous/Sie, not tú/tu/du).
 - If segment_type = "answer_option":
     - Treat this as a stand-alone answer choice shown under a question.
     - You MUST follow the block_style exactly for this answer option.
@@ -3745,6 +3969,26 @@ async def process_row_async(
             row.new_translation = row.existing_translation
             return row
 
+        # Known-phrase pre-emption: deterministic translations for standardized survey
+        # comment strings (e.g. "Select one", "Select all that apply", "Select up to 3").
+        # Mirrors the numeric-guard pattern: never overwrites human work, only suggests.
+        known_phrase = lookup_known_survey_phrase(eng_text, context.language_code)
+        if known_phrase:
+            if not row.had_real_translation:
+                row.new_translation = known_phrase
+                row.was_newly_translated = True
+                return row
+            else:
+                # Keep the existing human translation; offer the canonical as a suggestion.
+                row.new_translation = row.existing_translation
+                if not (row.suggested_translation or "").strip():
+                    row.suggested_translation = known_phrase
+                    row.suggestion_reason = (
+                        (row.suggestion_reason + " | " if row.suggestion_reason else "")
+                        + "Known-phrase check: this is a standardized survey instruction — "
+                        f"canonical translation is '{known_phrase}'."
+                    )
+                return row
 
         # Hard guard: if the source is *purely* numeric/range/code-like (e.g., '1970-1989'),
         # keep it as a pure range/code in the output. This prevents drift into prose like
@@ -3976,9 +4220,13 @@ async def process_row_async(
             style_note = _format_style_note(bs)
             t1 = row.new_translation
 
+            # Clause-form blocks get high-priority judge scrutiny for structural coherence.
+            high_priority = bool(bs and getattr(bs, "options_phrase_form", None) == "clause")
+
             # Judge T1
             j1 = await judge_translation_async(
-                eng_text, t1, context.language_code, style_note
+                eng_text, t1, context.language_code, style_note,
+                high_priority=high_priority,
             )
 
             if j1.get("error") or j1.get("score") is None:
@@ -4028,7 +4276,8 @@ async def process_row_async(
 
                 # Judge T2 exactly once — no further retry regardless of score
                 j2 = await judge_translation_async(
-                    eng_text, row.new_translation, context.language_code, style_note
+                    eng_text, row.new_translation, context.language_code, style_note,
+                    high_priority=high_priority,
                 )
                 if not j2.get("error") and j2.get("score") is not None:
                     row.judge_score = j2["score"]
@@ -4296,12 +4545,16 @@ async def judge_translation_async(
     language_code: str,
     style_note: str = "",
     model_name: str = MODEL_NAME,
+    high_priority: bool = False,
 ) -> dict:
     """
     LLM judge for the critique-and-revise quality loop (Step 2 in the plan).
 
     Asks the model to score *translation* on a 1-5 naturalness/register scale
     and return a specific reason sentence.
+
+    high_priority: when True (clause-form blocks), the judge is additionally
+    instructed to check clause-structure consistency within the block.
 
     Returns {"score": int, "reason": str} on success, or
             {"score": None, "reason": "", "error": True} on terminal failure.
@@ -4313,6 +4566,13 @@ async def judge_translation_async(
     """
     lang = code_to_language_label(language_code) or language_code
 
+    clause_note = (
+        " Pay particular attention to whether the clause structure "
+        "(e.g. subordinate vs main clause, subjunctive vs conditional) is consistent "
+        "with the other answer options in this block."
+        if high_priority else ""
+    )
+
     messages = [
         {
             "role": "system",
@@ -4320,7 +4580,8 @@ async def judge_translation_async(
                 f"You are a survey-localization QA reviewer for {lang}. "
                 f"Judge whether the translation reads as natural survey copy in {lang} "
                 f"and whether its register is consistent with the style log provided. "
-                f"Score 1 (very poor) to 5 (excellent). "
+                f"Score 1 (very poor) to 5 (excellent)."
+                f"{clause_note} "
                 f'Return ONLY valid JSON: {{"score": <integer 1-5>, "reason": "<one specific sentence explaining the score>"}}'
             ),
         },
